@@ -6,6 +6,7 @@ flag-gated path; ``mock`` is for tests only and must be explicitly requested.
 """
 from .base import VerificationResult, Verifier, build_verifier
 from .dojo import DojoUnavailableError, LeanDojoVerifier
+from .dojo_v2 import DojoV2UnavailableError, LeanDojoV2Verifier, TacticStepResult
 from .mock import MockVerifier
 from .subprocess_lean import SubprocessLeanVerifier, VerificationError
 
@@ -17,5 +18,8 @@ __all__ = [
     "VerificationError",
     "LeanDojoVerifier",
     "DojoUnavailableError",
+    "LeanDojoV2Verifier",
+    "DojoV2UnavailableError",
+    "TacticStepResult",
     "MockVerifier",
 ]

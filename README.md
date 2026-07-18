@@ -127,7 +127,8 @@ v40_kaggle_bundle.main([
 | 后端 | 用途 | 说明 |
 |---|---|---|
 | `subprocess`（默认） | 生产 | 每次候选在独立临时目录拼接后跑 `lake env lean` 真实编译；词边界黑名单（剥注释后匹配 `sorry`/`admit`/`stop`）先行；超时杀整个进程组；不支持 symlink 的文件系统自动回退 copy |
-| `dojo` | 实验（flag-gated） | LeanDojo 通路；上游阻塞时 `init()` 显式抛 `DojoUnavailableError`，绝不静默降级 |
+| `dojo` | 实验（flag-gated） | LeanDojo 通路 v1；上游阻塞时 `init()` 显式抛 `DojoUnavailableError`，绝不静默降级 |
+| `dojo_v2` | 交互式 tactic 级（可用） | `LeanDojoV2Verifier`（`verify/dojo_v2.py`）：LeanDojo 交互 `run_tac` 通路，真实状态级验证（初始 goal → 逐步 tactic → 内核复核的 ProofFinished）。需先跑 `python3 /mnt/agents/output/patch_lean_dojo.py`（双向 FIFO + 内核前缀修复，幂等）并 trace 一次目标仓库（`python3 /mnt/agents/output/trace_noapi.py`）。除 SPEC `Verifier` 协议外另暴露 `open_task(task)`/`run_tactic(task, state_id, tactic)` 供搜索/agent 逐步验证；e2e 证据 `python3 /mnt/agents/output/dojo_e2e_proof.py`，根因链见 `/mnt/agents/output/dojo_breakthrough.md` |
 | `mock` | **仅测试** | 只认 `VALID` 标记；经此通路的结果全部 `unverified=True`，报告与 run json 标注 `[UNVERIFIED]` |
 
 任何相位的“成功”都必须再过一次统一 `verifier.verify_proof` 复核才入账——没有
@@ -137,7 +138,9 @@ v40_kaggle_bundle.main([
 
 - 验证即编译：LLM 生成的不可信文本会以当前用户权限真实编译（半可信威胁模型），
   生产部署建议对 verify 子进程加 rlimit/只读挂载；Kaggle 上注意隔离。
-- LeanDojo 通路被上游阻塞（详见 env_report），默认勿用。
+- LeanDojo 旧通路 v1 被上游阻塞（详见 env_report），默认勿用；交互式需求走
+  `dojo_v2`（已修复，见 dojo_breakthrough.md）：单会话串行、每任务一个 lean
+  进程（~0.8 GB RSS），大规模并发需自行限流并复用会话。
 - 搜索/agentic 长相位内部不轮询 shutdown，SIGTERM 后最坏延迟 ≈ 单任务时间预算
   （默认 600s）；token 预算按相位边界结算，单相位内可短暂超支。
 - Kimi（moonshot-v1-8k）基准中倾向输出 Lean 3 语法，不适合直接生成 Lean 4 证明，
