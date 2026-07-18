@@ -889,7 +889,7 @@ class ResolutionPipeline:
     async def _evaluate(self) -> None:
         try:
             snapshot = (
-                self.metrics.snapshot()
+                await maybe_await(self.metrics.snapshot())
                 if self.metrics is not None and hasattr(self.metrics, "snapshot")
                 else {}
             )
@@ -921,7 +921,7 @@ class ResolutionPipeline:
 
     # --------------------------------------------------------------- report
 
-    def _build_report(self, untouched: set[str]) -> RunReport:
+    async def _build_report(self, untouched: set[str]) -> RunReport:
         wall = time.time() - self._start_wall
         counts_status: dict[str, int] = {}
         counts_solver: dict[str, int] = {}
@@ -943,7 +943,7 @@ class ResolutionPipeline:
         counts_provider: dict[str, int] = {}
         if self.metrics is not None and hasattr(self.metrics, "snapshot"):
             try:
-                snap = self.metrics.snapshot() or {}
+                snap = await maybe_await(self.metrics.snapshot()) or {}
                 counts_provider = dict(snap.get("by_provider") or {})
             except Exception:
                 counts_provider = {}
