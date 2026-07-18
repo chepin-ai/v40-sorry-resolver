@@ -1,0 +1,6 @@
+.env
+v40_work/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
