@@ -301,7 +301,7 @@ class ResolutionPipeline:
                     pass
 
             await self._save_checkpoint(phase="finished")
-            report = self._build_report(untouched)
+            report = await self._build_report(untouched)
             await self._persist_report(report)
             self.emergence.record(
                 "run_finished",
