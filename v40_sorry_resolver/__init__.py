@@ -8,7 +8,7 @@ depends on the ``openai`` package, so its symbols are exposed lazily
 
 from .cache import Cache
 from .checkpoint import Checkpoint
-from .config import LLMProviderConfig, V40Config
+from .config import BudgetTier, LLMProviderConfig, V40Config
 from .metrics import MetricsCollector, get_global_metrics, reset_global_metrics
 from .models import (
     PriorityLevel,
@@ -50,6 +50,7 @@ __all__ = [
     "SorryTask",
     "ResolutionResult",
     # config
+    "BudgetTier",
     "LLMProviderConfig",
     "V40Config",
     # cache / checkpoint / metrics

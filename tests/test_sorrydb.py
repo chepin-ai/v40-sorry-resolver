@@ -172,3 +172,289 @@ async def test_sorrydb_client_failure_returns_empty_not_fake():
     client = SorryDBClient(endpoint="http://127.0.0.1:1/unreachable", timeout_s=1.0)
     assert client.enabled is True
     assert await client.fetch_tasks() == []
+
+
+# ======================================================================
+# Frontier integration: real SorryDB snapshots (frontier_resources sec. 1)
+# ======================================================================
+
+SORRYDB_ENTRY = {
+    "id": "sorrydb-entry-001",
+    "repo": {
+        "remote": "https://github.com/example/lean-repo",
+        "branch": "master",
+        "commit": "abc123def456",
+        "lean_version": "leanprover/lean4:v4.20.0",
+    },
+    "location": {
+        "path": "LeanRepo/Basic.lean",
+        "start_line": 42,
+        "start_column": 5,
+        "end_line": 42,
+        "end_column": 10,
+    },
+    "debug_info": {
+        "goal": "n m : Nat ⊢ n + m = m + n",
+        "url": "https://sorrydb.org/sorries/sorrydb-entry-001",
+    },
+    "metadata": {"blame_date": "2026-01-01", "inclusion_date": "2026-01-11"},
+}
+
+
+def _snapshot_doc(*entries) -> str:
+    import json
+
+    return json.dumps({"repos": [{"remote": "https://github.com/example/lean-repo"}],
+                       "sorries": list(entries)})
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_local_json_snapshot(tmp_path):
+    """Real SorryDB layout ({"repos": [...], "sorries": [...]}) from a local
+    JSON file is parsed with the pydantic-model field mapping."""
+    snap = tmp_path / "deduplicated_sorries.json"
+    snap.write_text(_snapshot_doc(SORRYDB_ENTRY), encoding="utf-8")
+    client = SorryDBClient(endpoint=str(snap))
+    assert client.enabled is True
+
+    tasks = await client.fetch_tasks()
+    assert len(tasks) == 1
+    t = tasks[0]
+    assert t.id == "sorrydb-entry-001"
+    assert t.file_path == "LeanRepo/Basic.lean"
+    assert t.line_number == 42
+    assert t.column_number == 5
+    assert t.goal_state == "n m : Nat ⊢ n + m = m + n"
+    # Repo remote becomes the project path when no local override is given.
+    assert t.project_path == "https://github.com/example/lean-repo"
+    assert "abc123def456" in t.surrounding_context
+    # SorryDB schema has no theorem name; missing field tolerated as "".
+    assert t.theorem_name == ""
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_local_jsonl_snapshot(tmp_path):
+    """JSONL (one sorry entry per line) is accepted as well."""
+    import json
+
+    snap = tmp_path / "sorries.jsonl"
+    lines = [json.dumps(SORRYDB_ENTRY), json.dumps({**SORRYDB_ENTRY, "id": "e2"})]
+    snap.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    client = SorryDBClient(endpoint=str(snap))
+
+    tasks = await client.fetch_tasks(project_path="/local/clone")
+    assert [t.id for t in tasks] == ["sorrydb-entry-001", "e2"]
+    assert all(t.project_path == "/local/clone" for t in tasks)
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_remote_url_mocked(monkeypatch):
+    """Remote URL: httpx is fully mocked; no real network access."""
+    import json
+
+    class FakeResp:
+        text = _snapshot_doc(SORRYDB_ENTRY)
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.requests = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, **kwargs):
+            self.requests.append(url)
+            return FakeResp()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    client = SorryDBClient(endpoint="https://sorrydb.example/snapshot.json")
+    tasks = await client.fetch_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].goal_state == "n m : Nat ⊢ n + m = m + n"
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_malformed_entries_tolerated(tmp_path):
+    """Entries missing location.path/start_line are skipped; valid ones kept."""
+    bad = {"id": "bad-1", "repo": {"remote": "x"}, "location": {"path": ""}}
+    snap = tmp_path / "snap.json"
+    snap.write_text(_snapshot_doc(bad, SORRYDB_ENTRY), encoding="utf-8")
+    client = SorryDBClient(endpoint=str(snap))
+
+    tasks = await client.fetch_tasks()
+    assert [t.id for t in tasks] == ["sorrydb-entry-001"]
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_empty_and_garbage_payloads(tmp_path, caplog):
+    """Empty file / garbage JSON -> WARNING + [], never fake tasks."""
+    empty = tmp_path / "empty.json"
+    empty.write_text("", encoding="utf-8")
+    assert await SorryDBClient(endpoint=str(empty)).fetch_tasks() == []
+
+    garbage = tmp_path / "garbage.json"
+    garbage.write_text("{not json at all", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert await SorryDBClient(endpoint=str(garbage)).fetch_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_client_missing_local_file(tmp_path, caplog):
+    """Nonexistent local path -> WARNING + [] (no fake tasks, v39 P1-9)."""
+    client = SorryDBClient(endpoint=str(tmp_path / "nope.json"))
+    with caplog.at_level("WARNING"):
+        assert await client.fetch_tasks() == []
+
+
+# ======================================================================
+# Frontier integration: SorryDB anti-cheat verification protocol (5.1)
+# (pure-text helpers -> no Lean toolchain needed)
+# ======================================================================
+
+_ANTI_CHEAT_FILE = (
+    "theorem foo (n : Nat) : n + 0 = n := by\n"
+    "  sorry\n"
+    "\n"
+    "theorem bar : True := by\n"
+    "  trivial\n"
+)
+
+
+def _make_verifier(tmp_path, sorrydb_mode=True, check_axioms=False):
+    from v40_sorry_resolver.config import V40Config
+    from v40_sorry_resolver.verify.subprocess_lean import SubprocessLeanVerifier
+
+    cfg = V40Config(
+        work_dir=str(tmp_path / "v40_work"),
+        sorrydb_mode=sorrydb_mode,
+        check_axioms=check_axioms,
+    )
+    return SubprocessLeanVerifier(cfg)
+
+
+def _write_project(tmp_path, content=_ANTI_CHEAT_FILE):
+    proj = tmp_path / "proj"
+    proj.mkdir(exist_ok=True)
+    (proj / "Main.lean").write_text(content, encoding="utf-8")
+    return str(proj)
+
+
+def _anti_cheat_task(project_path):
+    from v40_sorry_resolver.models import SorryTask
+
+    return SorryTask(
+        id="ac-1",
+        project_path=project_path,
+        file_path="Main.lean",
+        line_number=2,
+        column_number=3,
+        theorem_name="foo",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_mode_valid_proof_passes_integrity(tmp_path, monkeypatch):
+    """sorrydb_mode + honest proof: integrity checks pass, compile proceeds
+    (subprocess layer mocked out; no Lean toolchain needed)."""
+    from v40_sorry_resolver.verify.subprocess_lean import SubprocessLeanVerifier
+
+    verifier = _make_verifier(tmp_path)
+    project = _write_project(tmp_path)
+
+    async def fake_run_lean(self, run_dir, rel_file):
+        return 0, "", "", False
+
+    monkeypatch.setattr(SubprocessLeanVerifier, "_run_lean", fake_run_lean)
+    vr = await verifier.verify_proof(_anti_cheat_task(project), "simp")
+    assert vr.ok is True, vr.error
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_mode_statement_change_rejected(tmp_path):
+    """Protocol (2): a splice that alters the theorem statement is rejected."""
+    from v40_sorry_resolver.verify.subprocess_lean import VerificationError
+
+    verifier = _make_verifier(tmp_path)
+    project = _write_project(tmp_path)
+    task = _anti_cheat_task(project)
+    # Simulate a tampered splice output (statement weakened to `True`).
+    tampered = (
+        "theorem foo (n : Nat) : True := by\n"
+        "  simp\n"
+        "\n"
+        "theorem bar : True := by\n"
+        "  trivial\n"
+    )
+    with pytest.raises(VerificationError, match="statement modified"):
+        verifier._sorrydb_integrity_check(task, tampered)
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_mode_sorry_count_must_drop_exactly_one(tmp_path):
+    """Protocol (1): sorry count in the target theorem must drop by exactly 1."""
+    from v40_sorry_resolver.verify.subprocess_lean import VerificationError
+
+    verifier = _make_verifier(tmp_path)
+    project = _write_project(tmp_path)
+    task = _anti_cheat_task(project)
+    # New content where the sorry is NOT replaced (count unchanged).
+    with pytest.raises(VerificationError, match="exactly 1"):
+        verifier._sorrydb_integrity_check(task, _ANTI_CHEAT_FILE)
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_mode_axioms_sorryAx_rejected(tmp_path, monkeypatch):
+    """Protocol (3): check_axioms + `#print axioms` output with sorryAx -> reject."""
+    from v40_sorry_resolver.verify.subprocess_lean import SubprocessLeanVerifier
+
+    verifier = _make_verifier(tmp_path, check_axioms=True)
+    project = _write_project(tmp_path)
+
+    async def fake_run_lean(self, run_dir, rel_file):
+        # Compile OK but the axioms report leaks sorryAx.
+        return 0, "'foo' depends on axioms: [sorryAx]", "", False
+
+    monkeypatch.setattr(SubprocessLeanVerifier, "_run_lean", fake_run_lean)
+    vr = await verifier.verify_proof(_anti_cheat_task(project), "simp")
+    assert vr.ok is False
+    assert "sorryAx" in (vr.error or "")
+
+
+@pytest.mark.asyncio
+async def test_sorrydb_mode_off_keeps_default_behavior(tmp_path, monkeypatch):
+    """Default (sorrydb_mode=False) path is untouched by the protocol."""
+    from v40_sorry_resolver.verify.subprocess_lean import SubprocessLeanVerifier
+
+    verifier = _make_verifier(tmp_path, sorrydb_mode=False)
+    project = _write_project(tmp_path)
+
+    async def fake_run_lean(self, run_dir, rel_file):
+        return 0, "", "", False
+
+    monkeypatch.setattr(SubprocessLeanVerifier, "_run_lean", fake_run_lean)
+    vr = await verifier.verify_proof(_anti_cheat_task(project), "simp")
+    assert vr.ok is True, vr.error
+
+
+def test_theorem_facts_counts_sorries_and_statement(tmp_path):
+    """_theorem_facts: normalized statement + per-block sorry count."""
+    verifier = _make_verifier(tmp_path)
+    text = (
+        "theorem multi (n : Nat) : n = n := by\n"
+        "  have h : n = n := by sorry\n"
+        "  sorry  -- trailing comment with sorry word\n"
+    )
+    stmt, count = verifier._theorem_facts(text, "multi", 3)
+    assert count == 2  # comment occurrence is stripped
+    assert stmt == "theorem multi (n : Nat) : n = n"

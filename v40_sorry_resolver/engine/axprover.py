@@ -7,6 +7,12 @@ Anti-bloat fixes vs v39:
 - ``iterations`` reports the actual number of loop iterations;
 - ``verification_passed`` always comes from ``verifier.verify_proof`` — never
   self-signed (v39 P0-3).
+
+Verifier-guided repair (frontier_atp Top-8 #2; Goedel-V2/SorryDB/APOLLO/
+Numina-Lean-Agent all confirm iterative correction >> resampling): the
+notebook stores ``(lesson, raw_diagnostics)`` pairs — the CRITIC's compressed
+lesson *plus* the verifier's raw Lean diagnostics (truncated to ~500 chars) —
+and both are injected into the next propose prompt.
 """
 
 from __future__ import annotations
@@ -24,6 +30,8 @@ logger = logging.getLogger("v40.axprover")
 
 _MAX_LESSONS = 3
 _LESSON_CHARS = 200
+# Raw verifier diagnostics kept per notebook entry (frontier_atp Top-8 #2).
+_DIAG_CHARS = 500
 
 
 class AxProverV2:
@@ -35,6 +43,7 @@ class AxProverV2:
         metrics=None,
         cfg=None,
         emergence=None,
+        retriever=None,
     ):
         self.router = router
         self.verifier = verifier
@@ -42,9 +51,12 @@ class AxProverV2:
         self.metrics = metrics
         self.cfg = cfg
         self.emergence = emergence
+        # Optional premise retriever (frontier_atp Top-8 #6); None = disabled.
+        self.retriever = retriever
         # Introspection mirror of the LAST completed solve's notebook only;
         # the working notebook is a solve() local (per-task isolation, N-3).
-        self.notebook: list[str] = []
+        # Entries are (lesson, raw_diagnostics) pairs (frontier_atp Top-8 #2).
+        self.notebook: list[tuple[str, str]] = []
 
     def _stall_patience(self) -> int:
         return int(getattr(self.cfg, "agentic_stall_patience", 3) or 3)
@@ -56,8 +68,11 @@ class AxProverV2:
         prover = self.router.client(Role.PROVER)
 
         # Per-task notebook (N-3): local state, bounded to the last
-        # _MAX_LESSONS lessons of <=200 chars; never shared across tasks.
-        notebook: list[str] = []
+        # _MAX_LESSONS (lesson, raw_diagnostics) pairs; never shared across
+        # tasks. Raw diagnostics are the verifier's own Lean output (truncated
+        # to ~500 chars) so the next round sees the real compiler feedback
+        # alongside the CRITIC's lesson (frontier_atp Top-8 #2).
+        notebook: list[tuple[str, str]] = []
 
         tokens_used = 0
         iterations = 0
@@ -119,7 +134,7 @@ class AxProverV2:
                         verification_passed=True,  # grounded in vr.ok above
                     )
                 last_error = f"critic rejected: {note}"
-                self._push_lesson(notebook, f"critic: {note}"[:_LESSON_CHARS])
+                self._push_lesson(notebook, f"critic: {note}"[:_LESSON_CHARS], "")
             else:
                 diagnostics = getattr(vr, "diagnostics", "") or getattr(
                     vr, "error", ""
@@ -154,7 +169,9 @@ class AxProverV2:
 
     # ------------------------------------------------------------ internals
 
-    async def _propose(self, task: SorryTask, prover, strategy, notebook: list[str]):
+    async def _propose(
+        self, task: SorryTask, prover, strategy, notebook: list[tuple[str, str]]
+    ):
         thinking = bool(getattr(strategy, "enable_thinking", False))
         max_tokens = (
             int(getattr(strategy, "thinking_max_tokens", 2048))
@@ -163,14 +180,25 @@ class AxProverV2:
         )
         lessons_block = ""
         if notebook:
-            lessons_block = "Recent lessons (avoid repeating these mistakes):\n" + "\n".join(
-                f"- {l}" for l in notebook[-_MAX_LESSONS:]
+            # Each entry: CRITIC lesson + the raw verifier diagnostics that
+            # produced it (verifier-guided repair, frontier_atp Top-8 #2).
+            parts = []
+            for lesson, raw_diag in notebook[-_MAX_LESSONS:]:
+                entry = f"- {lesson}"
+                if raw_diag:
+                    entry += f"\n  Raw verifier diagnostics: {raw_diag}"
+                parts.append(entry)
+            lessons_block = (
+                "Recent lessons (avoid repeating these mistakes):\n"
+                + "\n".join(parts)
             )
+        premises_block = await self._retrieve_premises(task)
         prompt = (
             f"Theorem {task.theorem_name} (file {task.file_path}, "
             f"line {task.line_number}).\n"
             f"Goal: {task.goal_state or '(infer from context)'}\n"
             f"Context:\n{(task.surrounding_context or '')[:2000]}\n"
+            f"{premises_block}"
             f"{lessons_block}\n"
             "Produce a complete Lean 4 proof. Respond with Lean code only, "
             "inside a ```lean fenced block."
@@ -196,16 +224,49 @@ class AxProverV2:
         )
         return extract_lean_code(getattr(resp, "text", "") or ""), tokens, None
 
+    async def _retrieve_premises(self, task: SorryTask) -> str:
+        """Optional premise-retrieval prompt block (frontier_atp Top-8 #6).
+
+        Only fires when a retriever is wired (config ``retrieval_enabled``)
+        AND the goal mentions mathlib-style constants. Any failure degrades to
+        an empty block — retrieval never blocks the solving flow.
+        """
+        if self.retriever is None:
+            return ""
+        try:
+            from v40_sorry_resolver.engine.retrieval import has_mathlib_constant
+
+            goal = task.goal_state or ""
+            if not has_mathlib_constant(goal):
+                return ""
+            premises = await self.retriever.search_premises(goal, top_k=5)
+        except Exception as exc:
+            logger.debug("premise retrieval unavailable: %s", exc)
+            return ""
+        if not premises:
+            return ""
+        return "Related Mathlib lemmas (retrieved):\n" + "".join(
+            f"- {name}\n" for name in premises
+        )
+
     async def _add_lesson(
-        self, task: SorryTask, proof: str, diagnostics: str, notebook: list[str]
+        self,
+        task: SorryTask,
+        proof: str,
+        diagnostics: str,
+        notebook: list[tuple[str, str]],
     ) -> None:
         try:
             lesson = await self.critic.summarize_lesson(task, proof, diagnostics)
         except Exception as exc:
             lesson = f"unknown: critic unavailable ({exc})"
-        self._push_lesson(notebook, lesson)
+        self._push_lesson(notebook, lesson, diagnostics)
 
     @staticmethod
-    def _push_lesson(notebook: list[str], lesson: str) -> None:
-        notebook.append(str(lesson)[:_LESSON_CHARS])
+    def _push_lesson(
+        notebook: list[tuple[str, str]], lesson: str, raw_diagnostics: str = ""
+    ) -> None:
+        notebook.append(
+            (str(lesson)[:_LESSON_CHARS], str(raw_diagnostics or "")[:_DIAG_CHARS])
+        )
         del notebook[:-_MAX_LESSONS]

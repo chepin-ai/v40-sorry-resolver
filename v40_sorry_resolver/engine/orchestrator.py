@@ -29,6 +29,7 @@ from v40_sorry_resolver.models import (
     SorryTask,
 )
 from v40_sorry_resolver.llm.router import Role
+from v40_sorry_resolver.progress import LeanProgressV2
 from v40_sorry_resolver.engine import extract_lean_code, maybe_await
 from v40_sorry_resolver.engine.agents import CriticAgent, EmergenceLog, OrchestratorLLM
 from v40_sorry_resolver.engine.axprover import AxProverV2
@@ -69,6 +70,43 @@ class StrategyConfig:
             thinking_max_tokens=int(getattr(cfg, "thinking_max_tokens", 2048)),
             enable_thinking=True,
             phase_order=["rfl", "direct", "search", "agentic"],
+            explorer_share=0.3,
+        )
+
+    @classmethod
+    def for_tier(cls, tier: Any) -> "StrategyConfig":
+        """Cost-aware preset per ``BudgetTier`` (frontier_atp Top-8 #8).
+
+        LIGHT (<=3 predicted steps): depth2/width1/iter3, thinking off —
+        cheap goals never burn deep-search budget. STANDARD: the current
+        defaults. DEEP (>8 steps): depth5/width3/iter10, thinking on.
+        """
+        from v40_sorry_resolver.config import BudgetTier
+
+        if tier is BudgetTier.LIGHT:
+            return cls(
+                tactic_search_depth=2,
+                tactic_search_width=1,
+                agentic_max_iterations=3,
+                thinking_max_tokens=2048,
+                enable_thinking=False,
+                explorer_share=0.3,
+            )
+        if tier is BudgetTier.DEEP:
+            return cls(
+                tactic_search_depth=5,
+                tactic_search_width=3,
+                agentic_max_iterations=10,
+                thinking_max_tokens=2048,
+                enable_thinking=True,
+                explorer_share=0.3,
+            )
+        return cls(
+            tactic_search_depth=4,
+            tactic_search_width=2,
+            agentic_max_iterations=8,
+            thinking_max_tokens=2048,
+            enable_thinking=True,
             explorer_share=0.3,
         )
 
@@ -225,11 +263,28 @@ class ResolutionPipeline:
 
         work_dir = getattr(cfg, "work_dir", None)
         self.emergence = EmergenceLog(work_dir)
-        self.critic = CriticAgent(router, metrics=metrics, emergence=self.emergence)
+        # Optional premise retrieval (frontier_atp Top-8 #6; default OFF).
+        retriever = None
+        if bool(getattr(cfg, "retrieval_enabled", False)):
+            from v40_sorry_resolver.engine.retrieval import PremiseRetriever
+
+            retriever = PremiseRetriever()
+        # Cost-aware tiering (frontier_atp Top-8 #8): tasks are bucketed by
+        # LeanProgressV2 predicted_steps into LIGHT/STANDARD/DEEP presets.
+        self._progress = LeanProgressV2(cache=cache)
+        self._strategy_adjusted = False  # dynamic OrchestratorLLM change wins
+        self.critic = CriticAgent(
+            router, metrics=metrics, emergence=self.emergence, retriever=retriever
+        )
         self.orchestrator_llm = OrchestratorLLM(
             router, base_strategy=strategy, emergence=self.emergence, metrics=metrics
         )
-        self.search_engine = TacticSearchEngine(router, verifier, metrics=metrics)
+        self.search_engine = TacticSearchEngine(
+            router,
+            verifier,
+            metrics=metrics,
+            length_norm_alpha=getattr(cfg, "search_length_norm_alpha", None),
+        )
         self.axprover = AxProverV2(
             router,
             verifier,
@@ -237,6 +292,7 @@ class ResolutionPipeline:
             metrics=metrics,
             cfg=cfg,
             emergence=self.emergence,
+            retriever=retriever,
         )
 
     # ------------------------------------------------------------------ API
@@ -531,6 +587,17 @@ class ResolutionPipeline:
                 if self._wall_remaining() <= 0:
                     return
                 strategy = self.strategy
+                if not self._strategy_adjusted:
+                    # Cost-aware tiering (frontier_atp Top-8 #8): pick the
+                    # LIGHT/STANDARD/DEEP preset matching this task's
+                    # predicted steps. A real OrchestratorLLM dynamic
+                    # adjustment (self._strategy_adjusted) takes priority.
+                    try:
+                        strategy = StrategyConfig.for_tier(
+                            self._progress.budget_tier(task)
+                        )
+                    except Exception:
+                        strategy = self.strategy
                 if self._soft_deadline_passed():
                     strategy = strategy.degraded()
                 self._started_ids.add(task.id)
@@ -908,6 +975,13 @@ class ResolutionPipeline:
         try:
             new_strategy = await self.orchestrator_llm.plan(summary)
             if new_strategy is not None:
+                if (
+                    hasattr(new_strategy, "to_dict")
+                    and new_strategy.to_dict() != self.strategy.to_dict()
+                ):
+                    # A real dynamic adjustment: it takes priority over the
+                    # per-task tier presets (frontier_atp Top-8 #8).
+                    self._strategy_adjusted = True
                 self.strategy = new_strategy
         except Exception as exc:
             logger.warning("orchestrator plan failed (%s); keeping base strategy", exc)
@@ -923,6 +997,11 @@ class ResolutionPipeline:
                 snapshot, self.strategy
             )
             if new_strategy is not None:
+                if (
+                    hasattr(new_strategy, "to_dict")
+                    and new_strategy.to_dict() != self.strategy.to_dict()
+                ):
+                    self._strategy_adjusted = True
                 self.strategy = new_strategy
         except Exception as exc:
             logger.warning("evaluate_and_adjust failed (%s); strategy unchanged", exc)

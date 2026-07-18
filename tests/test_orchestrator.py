@@ -337,3 +337,109 @@ async def test_checkpoint_metrics_is_json_snapshot(make_task, base_config, tmp_p
     assert isinstance(saved["metrics"], dict)
     assert "MetricsCollector object" not in json.dumps(saved["metrics"])
     assert saved["metrics"]["tasks"]["processed"] == 1
+
+
+# ======================================================================
+# Frontier: cost-aware three-tier budgets (frontier_atp Top-8 #8)
+# ======================================================================
+
+from v40_sorry_resolver.config import BudgetTier
+
+
+def test_strategy_config_for_tier_presets():
+    light = StrategyConfig.for_tier(BudgetTier.LIGHT)
+    assert (light.tactic_search_depth, light.tactic_search_width) == (2, 1)
+    assert light.agentic_max_iterations == 3
+    assert light.enable_thinking is False
+
+    standard = StrategyConfig.for_tier(BudgetTier.STANDARD)
+    # STANDARD = current defaults (SPEC 3.2/from_config).
+    assert (standard.tactic_search_depth, standard.tactic_search_width) == (4, 2)
+    assert standard.agentic_max_iterations == 8
+    assert standard.enable_thinking is True
+
+    deep = StrategyConfig.for_tier(BudgetTier.DEEP)
+    assert (deep.tactic_search_depth, deep.tactic_search_width) == (5, 3)
+    assert deep.agentic_max_iterations == 10
+    assert deep.enable_thinking is True
+
+
+def _spy_on_agentic(pipeline):
+    recorded = []
+    orig_solve = pipeline.axprover.solve
+
+    async def spy(task, strategy):
+        recorded.append(
+            (
+                task.id,
+                strategy.tactic_search_depth,
+                strategy.agentic_max_iterations,
+                strategy.enable_thinking,
+            )
+        )
+        return await orig_solve(task, strategy)
+
+    pipeline.axprover.solve = spy
+    return recorded
+
+
+@pytest.mark.asyncio
+async def test_pipeline_picks_tier_strategy_per_task(make_task, base_config):
+    """LIGHT task (predicted_steps<=3) gets the LIGHT preset; DEEP task
+    (predicted_steps>8) gets the DEEP preset."""
+    base_config.num_workers = 2
+    # All roles produce junk so every phase fails and reaches agentic (the
+    # DEEP width-3 beam also consults EXPLORER; pin it to junk explicitly).
+    router = FakeRouter(
+        {
+            Role.PROVER: FakeLLMClient(Role.PROVER, script="junk"),
+            Role.EXPLORER: FakeLLMClient(Role.EXPLORER, script="junk"),
+            Role.CRITIC: FakeLLMClient(Role.CRITIC),
+        }
+    )
+    pipeline = _pipeline(base_config, router, FakeVerifier())
+    recorded = _spy_on_agentic(pipeline)
+
+    tasks = [
+        make_task(0, predicted_steps=2),   # LIGHT
+        make_task(1, predicted_steps=12),  # DEEP
+    ]
+    report = await pipeline.run(tasks, resume=False)
+    assert report.processed == 2
+    assert len(recorded) == 2
+    by_id = dict((r[0], r[1:]) for r in recorded)
+    # LIGHT preset: depth2 / iter3 / no thinking.
+    assert by_id["task-000"] == (2, 3, False)
+    # DEEP preset: depth5 / iter10 / thinking on.
+    assert by_id["task-001"] == (5, 10, True)
+
+
+@pytest.mark.asyncio
+async def test_dynamic_adjustment_takes_priority_over_tier(make_task, base_config):
+    """When OrchestratorLLM really changes the strategy, the adjusted strategy
+    wins over the per-task tier preset."""
+    base_config.num_workers = 1
+    adjust_json = (
+        '{"tactic_search_depth": 6, "tactic_search_width": 1, '
+        '"agentic_max_iterations": 5, "enable_thinking": true, '
+        '"explorer_share": 0.2, "rationale": "go deeper"}'
+    )
+    router = FakeRouter(
+        {
+            Role.ORCHESTRATOR: FakeLLMClient(Role.ORCHESTRATOR, script=adjust_json),
+            Role.PROVER: FakeLLMClient(Role.PROVER, script="junk"),
+            Role.EXPLORER: FakeLLMClient(Role.EXPLORER, script="junk"),
+            Role.CRITIC: FakeLLMClient(Role.CRITIC),
+        }
+    )
+    pipeline = _pipeline(base_config, router, FakeVerifier())
+    recorded = _spy_on_agentic(pipeline)
+
+    # LIGHT task: tier preset would be depth2/thinking-off, but the dynamic
+    # adjustment (valve-limited: depth 2->3, thinking on) must win.
+    await pipeline.run([make_task(0, predicted_steps=2)], resume=False)
+    assert pipeline._strategy_adjusted is True
+    assert len(recorded) == 1
+    _, depth, _, thinking = recorded[0]
+    assert depth == 3          # adjusted (2 + valve 1), NOT the LIGHT preset 2
+    assert thinking is True    # adjusted, NOT the LIGHT preset off

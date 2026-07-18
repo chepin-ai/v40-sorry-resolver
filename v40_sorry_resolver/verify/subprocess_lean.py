@@ -20,6 +20,10 @@ Algorithm per ``verify_proof``:
      process is reaped in ``finally`` (no leaks, fixes v39 P0-7 style issues).
   5. Optional ``check_axioms``: append ``#print axioms <name>`` and reject if
      the output mentions ``sorryAx`` (SPEC 3.7.5).
+  5b. Optional ``sorrydb_mode`` (frontier_atp 5.1 anti-cheat protocol): the
+     splice must drop the target theorem's sorry count by exactly 1 and must
+     leave the theorem statement text unchanged; with ``check_axioms`` the
+     ``sorryAx`` rejection completes the 3-part protocol.
   6. A clean base copy of each project is built once under
      ``work_dir/verify_tmp`` (content-addressed); each call only re-materialises
      the target file into a fresh symlink-forest run dir (SPEC 3.7.6).
@@ -136,6 +140,8 @@ class SubprocessLeanVerifier:
         self._timeout = float(getattr(cfg, "lean_timeout_s", 30.0) or 30.0)
         self._max_concurrent = int(getattr(cfg, "max_concurrent_lean", 4) or 4)
         self._check_axioms = bool(getattr(cfg, "check_axioms", False))
+        # SorryDB anti-cheat protocol (frontier_atp 5.1 / Top-8 #7).
+        self._sorrydb_mode = bool(getattr(cfg, "sorrydb_mode", False))
         work_dir = getattr(cfg, "work_dir", "./v40_work") or "./v40_work"
         self._verify_tmp = Path(work_dir) / "verify_tmp"
         # Environment with elan on PATH (explicitly passed to subprocess).
@@ -196,6 +202,20 @@ class SubprocessLeanVerifier:
             return VerificationResult(
                 ok=False, error=str(exc), duration_s=time.monotonic() - t0
             )
+
+        if self._sorrydb_mode:
+            # SorryDB anti-cheat protocol (frontier_atp 5.1): (1) the target
+            # theorem's sorry count drops by exactly 1, (2) the theorem
+            # statement text is unchanged by the splice. (3) is the
+            # check_axioms sorryAx rejection below (when enabled).
+            try:
+                self._sorrydb_integrity_check(task, new_content)
+            except VerificationError as exc:
+                return VerificationResult(
+                    ok=False,
+                    error=f"sorrydb integrity: {exc}",
+                    duration_s=time.monotonic() - t0,
+                )
 
         if self._check_axioms:
             new_content += f"\n#print axioms {task.theorem_name}\n"
@@ -309,6 +329,88 @@ class SubprocessLeanVerifier:
             )
         orig_lines[sline] = orig_line[:scol] + replacement + orig_line[scol + 5:]
         return "\n".join(orig_lines), decl_idx + 1  # 1-based decl line
+
+    # ------------------------------------------- sorrydb anti-cheat (5.1)
+    def _sorrydb_integrity_check(self, task: SorryTask, new_content: str) -> None:
+        """SorryDB verification protocol (frontier_atp 5.1 / Top-8 #7).
+
+        Asserts, on the comment-stripped texts before/after the splice:
+          (1) the target theorem's ``sorry`` count drops by exactly 1;
+          (2) the theorem statement (decl keyword .. first depth-0 ``:=``)
+              is byte-identical modulo whitespace.
+
+        Raises ``VerificationError`` on any violation. Check (3) of the
+        protocol (``#print axioms`` must not report ``sorryAx``) lives in
+        ``verify_proof`` and is active when ``check_axioms`` is enabled.
+        """
+        src_path = Path(task.project_path) / task.file_path
+        if not src_path.is_file():
+            raise VerificationError(f"source file not found: {src_path}")
+        original = src_path.read_text(encoding="utf-8")
+        stmt_before, sorries_before = self._theorem_facts(
+            original, task.theorem_name, task.line_number
+        )
+        stmt_after, sorries_after = self._theorem_facts(
+            new_content, task.theorem_name, task.line_number
+        )
+        if stmt_after != stmt_before:
+            raise VerificationError(
+                "theorem statement modified by proof splice "
+                f"(before={stmt_before[:120]!r}, after={stmt_after[:120]!r})"
+            )
+        if sorries_after != sorries_before - 1:
+            raise VerificationError(
+                "sorry count must drop by exactly 1 in the target theorem "
+                f"(before={sorries_before}, after={sorries_after})"
+            )
+
+    def _theorem_facts(
+        self, text: str, theorem_name: str, line_number: int
+    ) -> tuple[str, int]:
+        """(normalized statement, sorry count) of the target theorem block."""
+        code = _strip_comments(text)
+        code_lines = code.split("\n")
+        decl_idx = self._find_decl(code_lines, theorem_name, line_number)
+        block_end = self._find_block_end(code_lines, decl_idx)
+        statement = self._statement_prefix(code, code_lines, decl_idx)
+        sorries = 0
+        sorry_re = re.compile(r"\bsorry\b")
+        for i in range(decl_idx, block_end):
+            sorries += len(sorry_re.findall(code_lines[i]))
+        return statement, sorries
+
+    @staticmethod
+    def _statement_prefix(code: str, code_lines: list[str], decl_idx: int) -> str:
+        """Normalized statement text: decl start .. first depth-0 ``:=``.
+
+        Deterministic extraction shared by the before/after comparison; if no
+        top-level ``:=`` exists, falls back to the declaration line.
+        """
+        decl_start = sum(len(l) + 1 for l in code_lines[:decl_idx])
+        depth = 0
+        in_str = False
+        j = decl_start
+        limit = min(len(code), decl_start + 8000)  # safety bound
+        while j < limit:
+            c = code[j]
+            if in_str:
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == '"':
+                    in_str = False
+                j += 1
+                continue
+            if c == '"':
+                in_str = True
+            elif c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth = max(0, depth - 1)
+            elif depth == 0 and code.startswith(":=", j):
+                return re.sub(r"\s+", " ", code[decl_start:j]).strip()
+            j += 1
+        return re.sub(r"\s+", " ", code_lines[decl_idx]).strip()
 
     @staticmethod
     def _find_decl(code_lines: list[str], name: str, line_number: int) -> int:

@@ -69,10 +69,12 @@ def _extract_json(text: str) -> Optional[dict]:
 class CriticAgent:
     """CRITIC role: lesson summarization / proof review / failure attribution."""
 
-    def __init__(self, router, metrics=None, emergence=None):
+    def __init__(self, router, metrics=None, emergence=None, retriever=None):
         self.router = router
         self.metrics = metrics
         self.emergence = emergence
+        # Optional premise retriever (frontier_atp Top-8 #6); None = disabled.
+        self.retriever = retriever
 
     async def summarize_lesson(
         self, task: SorryTask, proof: str, diagnostics: str
@@ -84,10 +86,12 @@ class CriticAgent:
             "'CATEGORY: lesson' where CATEGORY is one of "
             "syntax/type/strategy/direction."
         )
+        premises_block = await self._retrieve_premises(task)
         prompt = (
             f"Theorem {task.theorem_name}.\n"
             f"Failed proof attempt:\n{(proof or '(empty)')[:1200]}\n"
             f"Verifier diagnostics:\n{(diagnostics or '(none)')[:1200]}\n"
+            f"{premises_block}"
             "Summarize the root cause as one lesson for the next attempt."
         )
         try:
@@ -140,6 +144,31 @@ class CriticAgent:
         except Exception as exc:
             logger.warning("critic review failed (%s); defaulting to approve", exc)
             return True, f"review unavailable ({exc})"
+
+    async def _retrieve_premises(self, task: SorryTask) -> str:
+        """Optional premise-retrieval prompt block (frontier_atp Top-8 #6).
+
+        Fires only when a retriever is wired (config ``retrieval_enabled``)
+        and the goal mentions mathlib-style constants; any failure degrades
+        to an empty block — retrieval never blocks the solving flow.
+        """
+        if self.retriever is None:
+            return ""
+        try:
+            from v40_sorry_resolver.engine.retrieval import has_mathlib_constant
+
+            goal = task.goal_state or ""
+            if not has_mathlib_constant(goal):
+                return ""
+            premises = await self.retriever.search_premises(goal, top_k=5)
+        except Exception as exc:
+            logger.debug("critic premise retrieval unavailable: %s", exc)
+            return ""
+        if not premises:
+            return ""
+        return "Related Mathlib lemmas (retrieved):\n" + "".join(
+            f"- {name}\n" for name in premises
+        )
 
     @staticmethod
     def _clean_lesson(text: str) -> str:

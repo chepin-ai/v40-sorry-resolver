@@ -20,7 +20,7 @@ import logging
 from enum import Enum
 from typing import Optional
 
-from ..config import V40Config
+from ..config import LEGACY_DEEPSEEK_ALIASES, V40Config
 from .client import AsyncLLMClient
 
 __all__ = ["Role", "ROLE_TO_PROVIDER", "MultiLLMRouter"]
@@ -78,6 +78,16 @@ class MultiLLMRouter:
             if name.startswith("deepseek"):
                 reasoner = getattr(cfg, "deepseek_reasoner_model", "") or ""
                 client.reasoner_model = reasoner.strip() or None
+                # DeepSeek V4 migration (frontier_resources section 6): wire
+                # the retired legacy alias as a one-shot health-check fallback
+                # (two-stage probe) during the transition window.
+                client.fallback_model = LEGACY_DEEPSEEK_ALIASES.get(
+                    provider_cfg.model
+                )
+                if client.reasoner_model:
+                    client.reasoner_fallback_model = LEGACY_DEEPSEEK_ALIASES.get(
+                        client.reasoner_model
+                    )
             clients[name] = client
         return cls(clients, cfg.providers)
 

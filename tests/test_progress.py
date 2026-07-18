@@ -144,3 +144,52 @@ async def test_history_interface_missing_falls_back():
     await pred.load_history()
     tasks = pred.predict([_task("x", "1 + 1 = 2")])
     assert tasks[0].predicted_steps <= 4
+
+
+# ======================================================================
+# Frontier: cost-aware budget tiers (frontier_atp Top-8 #8)
+# ======================================================================
+
+from v40_sorry_resolver.config import BudgetTier
+
+
+def test_tier_for_steps_boundaries():
+    tier = LeanProgressV2.tier_for_steps
+    assert tier(0) is BudgetTier.STANDARD   # unknown -> safe default
+    assert tier(-5) is BudgetTier.STANDARD
+    assert tier(1) is BudgetTier.LIGHT
+    assert tier(3) is BudgetTier.LIGHT      # <=3 LIGHT
+    assert tier(4) is BudgetTier.STANDARD
+    assert tier(8) is BudgetTier.STANDARD   # <=8 STANDARD
+    assert tier(9) is BudgetTier.DEEP
+    assert tier(100) is BudgetTier.DEEP
+
+
+def test_budget_tier_uses_predicted_steps():
+    prog = LeanProgressV2()
+    light = _task("t_light", "n = n")
+    light.predicted_steps = 2
+    deep = _task("t_deep", "forall n, P n")
+    deep.predicted_steps = 12
+    assert prog.budget_tier(light) is BudgetTier.LIGHT
+    assert prog.budget_tier(deep) is BudgetTier.DEEP
+
+
+def test_budget_tier_computes_heuristic_when_unpredicted():
+    prog = LeanProgressV2()
+    # predicted_steps=0 -> heuristic runs: `X = X` shape is eq_refl (2 steps).
+    assert prog.budget_tier(_task("rfl_one", "myValue = myValue")) is BudgetTier.LIGHT
+    # A hard/generic goal lands in STANDARD or DEEP, never LIGHT.
+    hard = _task("hard_one", "∀ n : Nat, ∃ m, List.length (List.map f l) = m")
+    assert prog.budget_tier(hard) in (BudgetTier.STANDARD, BudgetTier.DEEP)
+
+
+def test_predict_then_tier_pipeline(mini_tasks):
+    """End-to-end: predict() fills steps, tiers partition the mini project."""
+    prog = LeanProgressV2()
+    tasks = prog.predict(mini_tasks)
+    tiers = {t.id: prog.budget_tier(t) for t in tasks}
+    assert set(tiers.values()) <= set(BudgetTier)
+    # The rfl-style trivial tasks (e.g. nat_refl) must land LIGHT.
+    by_name = {t.theorem_name: tiers[t.id] for t in tasks}
+    assert by_name["nat_refl"] is BudgetTier.LIGHT

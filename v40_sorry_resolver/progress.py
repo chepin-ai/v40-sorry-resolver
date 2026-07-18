@@ -22,6 +22,7 @@ import logging
 import re
 from typing import Optional
 
+from .config import BudgetTier
 from .models import PriorityLevel, SorryTask  # SPEC 3.1 contract (provided by M1)
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,12 @@ _HISTORY_NS = "progress"
 # rfl predicate constants (SPEC 3.9).
 RFL_MAX_STEPS = 4
 RFL_PRIORITIES = (PriorityLevel.P2_MEDIUM, PriorityLevel.P3_LOW)
+
+# Cost-aware budget-tier cutoffs on predicted_steps (frontier_atp Top-8 #8:
+# Seed-Prover light/medium/heavy split; EconProver shows returns collapse
+# past ~64 passes, so cheap goals must not burn deep-search budget).
+TIER_LIGHT_MAX_STEPS = 3
+TIER_STANDARD_MAX_STEPS = 8
 
 _EQ_RE = re.compile(r"^(?P<lhs>.+?)\s*=\s*(?P<rhs>.+?)$")
 _NUM_LIT_RE = re.compile(r"^[\d\s+\-*/%()·]+$")
@@ -106,6 +113,29 @@ class LeanProgressV2:
         weight_h = self._prior_strength
         blended = (heuristic_success * weight_h + smoothed * trials) / (weight_h + trials)
         return round(blended, 3)
+
+    # ---------------------------------------------------------- budget tiers
+    def budget_tier(self, task: SorryTask) -> BudgetTier:
+        """Cost-aware tier from predicted_steps (frontier_atp Top-8 #8).
+
+        <=3 predicted steps -> LIGHT (rfl/direct-scale budgets);
+        <=8 -> STANDARD (current defaults); >8 -> DEEP (max search/agentic
+        budget). Unknown (<=0, i.e. not yet predicted) -> STANDARD.
+        """
+        steps = int(getattr(task, "predicted_steps", 0) or 0)
+        if steps <= 0:  # not predicted yet -> compute heuristically
+            _, steps, _ = self._heuristic(task)
+        return self.tier_for_steps(steps)
+
+    @staticmethod
+    def tier_for_steps(steps: int) -> BudgetTier:
+        if steps <= 0:
+            return BudgetTier.STANDARD
+        if steps <= TIER_LIGHT_MAX_STEPS:
+            return BudgetTier.LIGHT
+        if steps <= TIER_STANDARD_MAX_STEPS:
+            return BudgetTier.STANDARD
+        return BudgetTier.DEEP
 
     # ---------------------------------------------------------- rfl predicate
     def is_rfl_candidate(self, task: SorryTask) -> bool:

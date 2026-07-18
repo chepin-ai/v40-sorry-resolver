@@ -8,11 +8,15 @@ line/column, the owning file, and the goal (extracted by paren-balancing the
 declaration header). It emits ``list[SorryTask]`` and **never injects fake
 tasks** (v39 P1-9): an empty scan logs a WARNING and returns ``[]``.
 
-``SorryDBClient`` is an optional remote source: disabled when ``endpoint`` is
-None, and any failure logs a WARNING and returns ``[]`` (again, no fake tasks).
+``SorryDBClient`` pulls real SorryDB snapshots (frontier_resources.md
+section 1) from a remote URL or a local JSON/JSONL file and maps the SorryDB
+pydantic schema (repo/location/debug_info/metadata) onto ``SorryTask``. It is
+disabled when ``endpoint`` is None; any failure logs a WARNING and returns
+``[]`` — never a fake task.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -247,7 +251,28 @@ class SorryScanner:
 
 
 class SorryDBClient:
-    """Optional remote SorryDB source. Disabled when endpoint is None."""
+    """Optional SorryDB snapshot source (frontier_resources.md section 1).
+
+    ``endpoint`` may be:
+    - ``None`` -> disabled (``enabled`` is False, ``fetch_tasks`` -> []);
+    - an ``http(s)://`` URL of a published SorryDB snapshot (e.g. the data
+      repo's ``deduplicated_sorries.json`` or the 125 KB smoke set
+      ``static_100_varied_recent_deduplicated_sorries.json``);
+    - a local filesystem path (or ``file://`` URI) to a snapshot file.
+
+    Snapshot formats accepted (real SorryDB layout, doc/DATABASE.md):
+    - **JSON**: a single object ``{"repos": [...], "sorries": [...]}`` (or a
+      bare list of sorry entries);
+    - **JSONL**: one sorry entry per line.
+
+    Each entry follows the SorryDB pydantic model: ``id``,
+    ``repo{remote, branch, commit, lean_version}``,
+    ``location{path, start_line, start_column, end_line, end_column}``,
+    ``debug_info{goal, url}``, ``metadata{...}``. Missing fields are tolerated
+    (entry skipped only when file/line are unusable). **No fake tasks are ever
+    injected** (v39 P1-9): empty payloads or any failure log a WARNING and
+    return ``[]``.
+    """
 
     def __init__(self, endpoint: Optional[str] = None, timeout_s: float = 10.0) -> None:
         self._endpoint = endpoint
@@ -258,31 +283,137 @@ class SorryDBClient:
         return bool(self._endpoint)
 
     async def fetch_tasks(self, project_path: str = "") -> list[SorryTask]:
-        """Fetch remote sorries; on any failure log a WARNING and return []."""
+        """Fetch snapshot sorries; on any failure log a WARNING and return []."""
         if not self.enabled:
             return []
         try:
-            import httpx
-        except Exception as exc:
-            logger.warning("SorryDBClient: httpx unavailable (%r); returning []", exc)
-            return []
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.get(self._endpoint)
-                resp.raise_for_status()
-                payload = resp.json()
-            entries = payload if isinstance(payload, list) else payload.get("items", [])
-            tasks = [t for t in (self._parse_entry(e, project_path) for e in entries) if t]
-            if not tasks:
-                logger.warning("SorryDBClient: endpoint returned no usable tasks")
-            return tasks
+            text = await self._load_text()
         except Exception as exc:
             # Never inject fake tasks; just report emptiness.
             logger.warning("SorryDBClient: fetch failed (%r); returning []", exc)
             return []
+        entries = self._parse_payload(text)
+        if not entries:
+            logger.warning(
+                "SorryDBClient: no sorry entries parsed from %s", self._endpoint
+            )
+            return []
+        tasks = [t for t in (self._parse_entry(e, project_path) for e in entries) if t]
+        if not tasks:
+            logger.warning("SorryDBClient: endpoint returned no usable tasks")
+        return tasks
+
+    # ------------------------------------------------------------ loading
+    async def _load_text(self) -> str:
+        """Return the raw snapshot text from a URL or a local file."""
+        endpoint = str(self._endpoint)
+        if endpoint.startswith(("http://", "https://")):
+            try:
+                import httpx
+            except Exception as exc:
+                raise RuntimeError(f"httpx unavailable: {exc!r}") from exc
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.get(endpoint)
+                resp.raise_for_status()
+                return resp.text
+        path = endpoint[7:] if endpoint.startswith("file://") else endpoint
+        # Local snapshot file; IO is tiny vs network so a thread offload is
+        # enough to keep the event loop responsive for large (65 MB) files.
+        return await asyncio.to_thread(Path(path).read_text, encoding="utf-8")
+
+    # ------------------------------------------------------------ parsing
+    @staticmethod
+    def _parse_payload(text: str) -> list:
+        """Parse snapshot text into a list of raw entry dicts (JSON or JSONL)."""
+        import json
+
+        text = (text or "").strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            # Real SorryDB layout: {"repos": [...], "sorries": [...]}.
+            for key in ("sorries", "items", "tasks"):
+                entries = payload.get(key)
+                if isinstance(entries, list):
+                    return entries
+            return []
+        if isinstance(payload, list):
+            return payload
+        # JSONL fallback: one entry per non-blank line.
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                logger.warning("SorryDBClient: skipping unparseable JSONL line")
+        return entries
+
+    @classmethod
+    def _parse_entry(cls, entry, project_path: str) -> Optional[SorryTask]:
+        """Map one entry (SorryDB pydantic shape or legacy flat shape)."""
+        if not isinstance(entry, dict):
+            logger.warning("SorryDBClient: skipping non-dict entry")
+            return None
+        if isinstance(entry.get("location"), dict) or isinstance(entry.get("repo"), dict):
+            return cls._parse_sorrydb_entry(entry, project_path)
+        return cls._parse_flat_entry(entry, project_path)
+
+    @classmethod
+    def _parse_sorrydb_entry(cls, entry: dict, project_path: str) -> Optional[SorryTask]:
+        """SorryDB snapshot model -> SorryTask (missing fields tolerated)."""
+        try:
+            location = entry.get("location") or {}
+            repo = entry.get("repo") or {}
+            debug_info = entry.get("debug_info") or {}
+            file_path = str(location.get("path") or entry.get("file_path") or "")
+            line = int(location.get("start_line") or entry.get("line_number") or 0)
+            if not file_path or line <= 0:
+                raise ValueError("missing location.path/start_line")
+            col = int(location.get("start_column") or entry.get("column_number") or 1)
+            remote = str(repo.get("remote") or "")
+            commit = str(repo.get("commit") or "")
+            # Theorem name is not part of the SorryDB schema; keep whatever a
+            # local/derived snapshot may add, else stay empty (tolerant).
+            name = str(entry.get("theorem_name") or entry.get("name") or "")
+            goal = str(debug_info.get("goal") or entry.get("goal_state") or "")
+            context_bits = []
+            if remote:
+                context_bits.append(
+                    f"repo: {remote}" + (f" @ {commit}" if commit else "")
+                )
+            if repo.get("lean_version"):
+                context_bits.append(f"lean: {repo['lean_version']}")
+            if debug_info.get("url"):
+                context_bits.append(f"url: {debug_info['url']}")
+            task_id = str(entry.get("id") or "") or hashlib.sha1(
+                f"{file_path}:{line}:{col}".encode()
+            ).hexdigest()[:12]
+            return SorryTask(
+                id=task_id,
+                project_path=project_path or str(entry.get("project_path") or remote),
+                file_path=file_path,
+                line_number=line,
+                column_number=col,
+                theorem_name=name,
+                goal_state=goal,
+                surrounding_context=str(
+                    entry.get("surrounding_context") or "\n".join(context_bits)
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("SorryDBClient: skipping malformed entry (%r)", exc)
+            return None
 
     @staticmethod
-    def _parse_entry(entry, project_path: str) -> Optional[SorryTask]:
+    def _parse_flat_entry(entry: dict, project_path: str) -> Optional[SorryTask]:
+        """Legacy flat v40 shape (file_path/line_number/theorem_name)."""
         try:
             file_path = str(entry["file_path"])
             line = int(entry["line_number"])

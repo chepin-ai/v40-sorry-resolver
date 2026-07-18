@@ -565,3 +565,83 @@ class TestRouter:
         assert "deepseek_a" in text
         assert "breaker" in text
         await router.close()
+
+
+# ======================================================================
+# Frontier: DeepSeek V4 migration — two-stage health probe
+# (frontier_resources section 6: legacy aliases retire 2026-07-24)
+# ======================================================================
+
+
+class TestTwoStageHealthProbe:
+    async def test_fallback_alias_adopted_when_primary_fails(self, fake_openai):
+        client = make_client(model="deepseek-v4-flash")
+        client.fallback_model = "deepseek-chat"
+        client.reasoner_model = "deepseek-v4-pro"
+        client.reasoner_fallback_model = "deepseek-reasoner"
+
+        async def fail_only_v4(**kwargs):
+            if kwargs.get("model") == "deepseek-v4-flash":
+                raise make_status_error(400)
+            return make_completion()
+
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = fail_only_v4
+
+        assert await client.health_check() is True
+        # Legacy alias adopted for both chat and reasoner models.
+        assert client.cfg.model == "deepseek-chat"
+        assert client.reasoner_model == "deepseek-reasoner"
+        models_probed = [c.kwargs["model"] for c in create.call_args_list]
+        assert models_probed == ["deepseek-v4-flash", "deepseek-chat"]
+
+    async def test_no_fallback_when_primary_healthy(self, fake_openai):
+        client = make_client(model="deepseek-v4-flash")
+        client.fallback_model = "deepseek-chat"
+        assert await client.health_check() is True
+        assert client.cfg.model == "deepseek-v4-flash"
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        assert create.call_count == 1  # single-stage probe only
+
+    async def test_fallback_absent_keeps_single_stage_behavior(self, fake_openai):
+        client = make_client()
+        assert client.fallback_model is None
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(401)
+        assert await client.health_check() is False
+        assert create.call_count == 1  # no second stage attempted
+
+    async def test_both_stages_fail_returns_false(self, fake_openai):
+        client = make_client(model="deepseek-v4-flash")
+        client.fallback_model = "deepseek-chat"
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(401)
+        assert await client.health_check() is False
+        assert client.cfg.model == "deepseek-v4-flash"  # unchanged
+        assert create.call_count == 2  # both stages probed
+
+    async def test_router_wires_legacy_alias_fallbacks(self, fake_openai, tmp_path):
+        cfg = router_config(tmp_path, enabled=("deepseek_a", "deepseek_b"))
+        cfg.providers["deepseek_a"].model = "deepseek-v4-flash"
+        cfg.providers["deepseek_b"].model = "deepseek-v4-flash"
+        cfg.deepseek_reasoner_model = "deepseek-v4-pro"
+        router = MultiLLMRouter.from_config(cfg)
+        for role in (Role.ORCHESTRATOR, Role.PROVER):
+            client = router.client(role)
+            assert client.fallback_model == "deepseek-chat"
+            assert client.reasoner_fallback_model == "deepseek-reasoner"
+        # Non-deepseek providers get no alias wiring.
+        cfg2 = router_config(tmp_path, enabled=("kimi",))
+        router2 = MultiLLMRouter.from_config(cfg2)
+        assert router2.client(Role.CRITIC).fallback_model is None
+        await router.close()
+        await router2.close()
+
+    async def test_router_no_alias_for_already_legacy_model(
+        self, fake_openai, tmp_path
+    ):
+        cfg = router_config(tmp_path, enabled=("deepseek_a",))
+        cfg.providers["deepseek_a"].model = "some-other-model"
+        router = MultiLLMRouter.from_config(cfg)
+        assert router.client(Role.ORCHESTRATOR).fallback_model is None
+        await router.close()

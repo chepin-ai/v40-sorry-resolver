@@ -85,6 +85,12 @@ class AsyncLLMClient:
         # Reasoning model used for thinking=True calls when the router wires
         # one (SPEC 3.3 reasoning-model routing); None = keep cfg.model.
         self.reasoner_model: Optional[str] = None
+        # DeepSeek V4 migration (frontier_resources section 6): when the
+        # configured model's health probe fails, the client retries once with
+        # this legacy alias (two-stage probe) before declaring the provider
+        # dead; on success the alias is adopted with a WARNING.
+        self.fallback_model: Optional[str] = None
+        self.reasoner_fallback_model: Optional[str] = None
         self._client = AsyncOpenAI(
             base_url=cfg.base_url,
             api_key=cfg.api_key or "unset",
@@ -227,11 +233,49 @@ class AsyncLLMClient:
         Falls back to ``/models`` only when the chat endpoint answers 404
         (providers without a chat-completions route).
 
+        Two-stage model probe (DeepSeek V4 migration, frontier_resources
+        section 6): when ``self.fallback_model`` is wired (a legacy alias of
+        the configured model, e.g. ``deepseek-v4-flash`` ->
+        ``deepseek-chat``) and the primary probe fails, the alias is probed
+        once; on success it is adopted (with a WARNING) so deployments keep
+        working through the alias-retirement window.
+
         A successful health check resets the circuit breaker.
         """
+        if await self._probe(self.cfg.model):
+            self._breaker_open = False
+            self._consecutive_4xx = 0
+            return True
+        if self.fallback_model and self.fallback_model != self.cfg.model:
+            logger.warning(
+                "health_check '%s': model %r probe failed; trying legacy "
+                "alias %r once (two-stage probe)",
+                self.cfg.name,
+                self.cfg.model,
+                self.fallback_model,
+            )
+            if await self._probe(self.fallback_model):
+                logger.warning(
+                    "health_check '%s': legacy alias %r works; adopting it. "
+                    "Migrate your config: the configured model %r is "
+                    "unreachable (DeepSeek legacy aliases retire 2026-07-24).",
+                    self.cfg.name,
+                    self.fallback_model,
+                    self.cfg.model,
+                )
+                self.cfg.model = self.fallback_model
+                if self.reasoner_model and self.reasoner_fallback_model:
+                    self.reasoner_model = self.reasoner_fallback_model
+                self._breaker_open = False
+                self._consecutive_4xx = 0
+                return True
+        return False
+
+    async def _probe(self, model: str) -> bool:
+        """Single 1-token chat probe against ``model`` (BUG-3 convention)."""
         try:
             await self._client.chat.completions.create(
-                model=self.cfg.model,
+                model=model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
                 timeout=self.cfg.timeout_s,
@@ -249,13 +293,14 @@ class AsyncLLMClient:
                         exc2,
                     )
                     return False
-            else:
-                logger.warning(
-                    "health_check '%s' chat probe failed: %s", self.cfg.name, exc
-                )
-                return False
-        self._breaker_open = False
-        self._consecutive_4xx = 0
+                return True
+            logger.warning(
+                "health_check '%s' chat probe failed (model %r): %s",
+                self.cfg.name,
+                model,
+                exc,
+            )
+            return False
         return True
 
     # ------------------------------------------------------------------

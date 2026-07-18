@@ -57,9 +57,10 @@ async def test_agentic_solves_on_second_iteration(make_task):
     assert result.iterations == 2  # actual iterations, not max
     assert result.verification_passed is True
     assert result.tokens_used > 0
-    # One failure lesson was recorded and kept bounded.
+    # One failure lesson was recorded and kept bounded; entries are
+    # (lesson, raw_diagnostics) pairs (frontier_atp Top-8 #2).
     assert 1 <= len(solver.notebook) <= 3
-    assert all(len(l) <= 200 for l in solver.notebook)
+    assert all(len(pair) == 2 and len(pair[0]) <= 200 for pair in solver.notebook)
 
 
 @pytest.mark.asyncio
@@ -91,7 +92,7 @@ async def test_lessons_truncated_to_200_chars(make_task):
     result = await solver.solve(make_task(0), _strategy(max_iter=4))
     assert result.success is False
     assert solver.notebook
-    assert all(len(l) <= 200 for l in solver.notebook)
+    assert all(len(pair[0]) <= 200 for pair in solver.notebook)
 
 
 @pytest.mark.asyncio
@@ -172,3 +173,69 @@ async def test_notebook_isolated_across_concurrent_tasks(make_task):
     # ...and NEVER the other task's lesson (the pre-fix pollution).
     assert "theorem_1 mistake" not in "\n".join(seen_prompts["theorem_0"])
     assert "theorem_0 mistake" not in "\n".join(seen_prompts["theorem_1"])
+
+
+# ======================================================================
+# Frontier: verifier-guided repair loop (frontier_atp Top-8 #2)
+# ======================================================================
+
+class _DiagnosticsVerifier(FakeVerifier):
+    """Fake verifier emitting a configurable raw diagnostics string."""
+
+    def __init__(self, diagnostics: str, **kwargs):
+        super().__init__(**kwargs)
+        self._diagnostics = diagnostics
+
+    async def verify_proof(self, task, proof):
+        vr = await super().verify_proof(task, proof)
+        if not vr.ok:
+            vr.diagnostics = self._diagnostics
+        return vr
+
+
+@pytest.mark.asyncio
+async def test_raw_diagnostics_injected_into_next_prompt(make_task):
+    """On verify failure the NEXT propose prompt must carry the CRITIC lesson
+    AND the verifier's raw Lean diagnostics (frontier_atp Top-8 #2)."""
+    raw_diag = "Main.lean:2:4: error: type mismatch\n  rfl\nhas type\n  ?m = ?m"
+    prompts: list[str] = []
+
+    def prover_script(prompt, system_prompt, role, idx):
+        prompts.append(prompt)
+        return "junk proof" if idx == 1 else "VALID proof v2"
+
+    router = _router(prover_script)
+    verifier = _DiagnosticsVerifier(raw_diag)
+    solver = AxProverV2(router, verifier, cfg=None)
+
+    result = await solver.solve(make_task(0), _strategy())
+    assert result.success is True
+    assert len(prompts) == 2
+    # Round-2 prompt: raw diagnostics + critic lesson both present.
+    assert "Raw verifier diagnostics" in prompts[1]
+    assert "type mismatch" in prompts[1]
+    assert "strategy: try a simpler tactic" in prompts[1]
+    # Round-1 prompt (no failures yet) must NOT contain the block.
+    assert "Raw verifier diagnostics" not in prompts[0]
+    # Notebook holds (lesson, raw_diagnostics) pairs, <=3 entries.
+    assert 1 <= len(solver.notebook) <= 3
+    lesson, diag = solver.notebook[-1]
+    assert lesson == "strategy: try a simpler tactic"
+    assert "type mismatch" in diag
+
+
+@pytest.mark.asyncio
+async def test_raw_diagnostics_truncated_to_500_chars(make_task):
+    """Raw diagnostics are truncated to ~500 chars per notebook entry."""
+    raw_diag = "E" * 1200
+    router = _router("junk proof")
+    verifier = _DiagnosticsVerifier(raw_diag)
+    solver = AxProverV2(router, verifier, cfg=None)
+
+    result = await solver.solve(make_task(0), _strategy(max_iter=2))
+    assert result.success is False
+    assert solver.notebook
+    for lesson, diag in solver.notebook:
+        assert len(lesson) <= 200
+        assert len(diag) <= 500
+    assert solver.notebook[-1][1] == "E" * 500

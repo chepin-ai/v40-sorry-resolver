@@ -49,9 +49,11 @@ class TestFromEnv:
 
     def test_real_default_models_and_urls(self, clean_env):
         cfg = V40Config.from_env(env_file=None)
-        assert cfg.providers["deepseek_a"].model == "deepseek-chat"
+        # DeepSeek V4 migration (frontier_resources section 6): real V4 names
+        # are the defaults; the old aliases retire 2026-07-24.
+        assert cfg.providers["deepseek_a"].model == "deepseek-v4-flash"
         assert cfg.providers["deepseek_a"].base_url == "https://api.deepseek.com/v1"
-        assert cfg.providers["deepseek_b"].model == "deepseek-chat"
+        assert cfg.providers["deepseek_b"].model == "deepseek-v4-flash"
         assert cfg.providers["kimi"].model == "moonshot-v1-8k"
         assert cfg.providers["kimi"].base_url == "https://api.moonshot.cn/v1"
         assert cfg.providers["longcat"].model == "LongCat-2.0"
@@ -59,7 +61,7 @@ class TestFromEnv:
             cfg.providers["longcat"].base_url
             == "https://api.longcat.chat/openai/v1"
         )
-        assert cfg.deepseek_reasoner_model == "deepseek-reasoner"
+        assert cfg.deepseek_reasoner_model == "deepseek-v4-pro"
 
     def test_keys_enable_providers(self, clean_env):
         clean_env.setenv("DEEPSEEK_API_KEY", "test-key-a")
@@ -219,3 +221,37 @@ class TestNoHardcodedSecrets:
     def test_source_contains_no_api_key_pattern(self):
         source = Path(config_mod.__file__).read_text(encoding="utf-8")
         assert not re.search(r"sk-[A-Za-z0-9]{8,}", source)
+
+
+# ======================================================================
+# Frontier integration: new config fields (items 1/3/4/5/6)
+# ======================================================================
+
+from v40_sorry_resolver.config import BudgetTier
+
+
+class TestFrontierDefaults:
+    def test_budget_tier_enum(self):
+        assert [t.name for t in BudgetTier] == ["LIGHT", "STANDARD", "DEEP"]
+
+    def test_frontier_field_defaults(self, clean_env):
+        cfg = V40Config.from_env(env_file=None)
+        # Item 3: length-normalized beam tie-break (default 0.1; 0 = legacy).
+        assert cfg.search_length_norm_alpha == 0.1
+        # Item 4: premise retrieval default OFF.
+        assert cfg.retrieval_enabled is False
+        # Item 1: SorryDB anti-cheat protocol default OFF.
+        assert cfg.sorrydb_mode is False
+        assert cfg.check_axioms is False
+
+    def test_negative_alpha_flagged(self, tmp_path):
+        cfg = V40Config(work_dir=str(tmp_path))
+        cfg.search_length_norm_alpha = -0.5
+        problems = cfg.validate()
+        assert any("search_length_norm_alpha" in p for p in problems)
+
+    def test_zero_alpha_is_valid(self, tmp_path):
+        cfg = V40Config(work_dir=str(tmp_path))
+        cfg.search_length_norm_alpha = 0.0
+        problems = cfg.validate()
+        assert not any("search_length_norm_alpha" in p for p in problems)

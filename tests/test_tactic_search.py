@@ -121,3 +121,72 @@ async def test_search_exhaustion_reports_actual_iterations(make_task):
     assert result.status == ProofStatus.FAILED_ALL
     assert result.iterations == len(verifier.calls)
     assert result.error
+
+
+# ======================================================================
+# Frontier: length-normalized beam tie-break (frontier_atp Top-8 #3,
+# BFS-Prover arXiv:2502.03438: score penalty alpha * log L)
+# ======================================================================
+
+import math
+
+
+def _tiebreak_engine(alpha):
+    prover = FakeLLMClient(Role.PROVER, script="t")
+    router = FakeRouter({Role.PROVER: prover})
+    return TacticSearchEngine(
+        router, FakeVerifier(), length_norm_alpha=alpha
+    )
+
+
+def test_length_tiebreak_math():
+    # alpha = 0 -> always 0 (regression-safe: pure FIFO tie-break).
+    assert _tiebreak_engine(0.0)._length_tiebreak("a b c d e") == 0.0
+    engine = _tiebreak_engine(0.1)
+    assert engine._length_tiebreak("one") == 0.0  # log(1) = 0
+    assert engine._length_tiebreak(" ".join(["t"] * 10)) == pytest.approx(
+        0.1 * math.log(10)
+    )
+    # Longer proofs get a strictly larger penalty.
+    assert engine._length_tiebreak("t " * 50) > engine._length_tiebreak("t t")
+
+
+def _two_candidate_setup():
+    """width=1, share=0.6 -> prover(long)+explorer(short) both proposed per
+    state; both rejected with the same remaining_sorries -> equal priority,
+    so the length tie-break alone picks the beam winner."""
+    long_tactic = " ".join(["alpha"] * 40)
+    prover = FakeLLMClient(Role.PROVER, script=long_tactic)
+    explorer = FakeLLMClient(Role.EXPLORER, script="b")
+    router = FakeRouter({Role.PROVER: prover, Role.EXPLORER: explorer})
+    verifier = FakeVerifier(remaining=1)  # equal priority for all candidates
+    return router, verifier, long_tactic
+
+
+@pytest.mark.asyncio
+async def test_length_norm_tiebreak_prefers_shorter_proof(make_task):
+    router, verifier, _ = _two_candidate_setup()
+    engine = TacticSearchEngine(router, verifier, length_norm_alpha=1.0)
+    strategy = _strategy(depth=2, width=1, share=0.6)
+
+    result = await engine.search(make_task(0), strategy)
+    assert result.success is False  # no VALID tactic anywhere
+    # Depth-2 expansions must build on the SHORT depth-1 winner.
+    depth2_states = [proof for _, proof in verifier.calls[2:]]
+    assert depth2_states, "expected depth-2 expansions"
+    assert all(s.startswith("b\n") for s in depth2_states), depth2_states
+
+
+@pytest.mark.asyncio
+async def test_alpha_zero_matches_fifo_tiebreak(make_task):
+    """alpha=0 reproduces the old behavior exactly: equal-priority ties are
+    broken by insertion order (prover candidate first)."""
+    router, verifier, long_tactic = _two_candidate_setup()
+    engine = TacticSearchEngine(router, verifier, length_norm_alpha=0.0)
+    strategy = _strategy(depth=2, width=1, share=0.6)
+
+    result = await engine.search(make_task(0), strategy)
+    assert result.success is False
+    depth2_states = [proof for _, proof in verifier.calls[2:]]
+    assert depth2_states
+    assert all(s.startswith("alpha") for s in depth2_states), depth2_states

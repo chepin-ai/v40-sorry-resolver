@@ -10,19 +10,33 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__all__ = ["LLMProviderConfig", "V40Config"]
+__all__ = ["LLMProviderConfig", "V40Config", "BudgetTier"]
 
 logger = logging.getLogger(__name__)
 
 VALID_VERIFIERS = ("subprocess", "dojo", "mock")
 
 # Public, real default model/base-URL values (SPEC 3.2 env contract).
+#
+# DeepSeek V4 migration (frontier_resources.md section 6, verified 2026-07):
+# the platform entered the V4 era on 2026-04-24; the old aliases
+# ``deepseek-chat`` / ``deepseek-reasoner`` retire on **2026-07-24**. New
+# defaults are the real V4 model names. ``LEGACY_DEEPSEEK_ALIASES`` maps each
+# new name back to its legacy alias so the health check can do a two-stage
+# probe (new name first, legacy alias as automatic fallback) during the
+# transition window.
 _DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-_DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
-_DEFAULT_DEEPSEEK_REASONER_MODEL = "deepseek-reasoner"
+_DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+_DEFAULT_DEEPSEEK_REASONER_MODEL = "deepseek-v4-pro"
+#: new V4 model name -> retired legacy alias (removal date 2026-07-24).
+LEGACY_DEEPSEEK_ALIASES = {
+    "deepseek-v4-flash": "deepseek-chat",
+    "deepseek-v4-pro": "deepseek-reasoner",
+}
 _DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
 _DEFAULT_KIMI_MODEL = "moonshot-v1-8k"
 # T1-verified working values (benchmark BUG-6): the old `openapi/v1` endpoint
@@ -34,6 +48,19 @@ _DEFAULT_LONGCAT_MODEL = "LongCat-2.0"
 MIN_THINKING_TIMEOUT_S = 240.0
 #: Normal (non-thinking) LLM timeout ceiling (SPEC: <= 60s).
 MAX_NORMAL_TIMEOUT_S = 60.0
+
+
+class BudgetTier(Enum):
+    """Cost-aware per-task budget tier (frontier_atp Top-8 #8).
+
+    Assigned from ``LeanProgressV2.predicted_steps``; the orchestrator picks a
+    matching ``StrategyConfig`` preset so cheap tasks never burn deep-search
+    budget (pass>64 marginal returns collapse, EconProver arXiv:2509.12603).
+    """
+
+    LIGHT = "LIGHT"
+    STANDARD = "STANDARD"
+    DEEP = "DEEP"
 
 
 @dataclass
@@ -59,6 +86,12 @@ class V40Config:
     verifier: str = "subprocess"  # subprocess|dojo|mock (mock only for tests)
     lean_timeout_s: float = 30.0
     max_concurrent_lean: int = 4
+    check_axioms: bool = False  # append `#print axioms`, reject sorryAx
+    # SorryDB anti-cheat protocol (frontier_atp 5.1 / Top-8 #7): when True the
+    # verifier additionally asserts (1) the target theorem's sorry count drops
+    # by exactly 1, (2) the theorem statement text is unchanged by the splice,
+    # (3) with check_axioms=True, `#print axioms` shows no sorryAx.
+    sorrydb_mode: bool = False
     # Concurrency & budgets
     num_workers: int = 8
     wall_clock_budget_s: float = 36000.0  # global budget, default 10h
@@ -73,6 +106,16 @@ class V40Config:
     thinking_max_tokens: int = 2048
     escalation_threshold: int = 3
     axiom_quota: int = 45
+    # Length-normalized beam tie-break (BFS-Prover, arXiv:2502.03438;
+    # frontier_atp Top-8 #3): same-priority candidates are ordered by
+    # alpha * log(L) where L is the accumulated proof length in tokens.
+    # alpha = 0.0 reproduces the previous FIFO tie-break exactly.
+    search_length_norm_alpha: float = 0.1
+    # Premise retrieval tool (frontier_atp Top-8 #6): leansearch.net +
+    # premise-search.com async clients feeding top-k Mathlib lemma names into
+    # Critic/AxProver prompts. Default OFF; failures degrade to [] + WARNING
+    # and never block the solving flow.
+    retrieval_enabled: bool = False
     # LLM
     providers: dict = field(default_factory=dict)  # filled by from_env
     llm_temperature: float = 0.3
@@ -215,6 +258,15 @@ class V40Config:
             )
         if self.axiom_quota < 0:
             problems.append(f"axiom_quota must be >= 0, got {self.axiom_quota}")
+        try:
+            alpha = float(self.search_length_norm_alpha)
+        except (TypeError, ValueError):
+            alpha = -1.0
+        if alpha < 0:
+            problems.append(
+                f"search_length_norm_alpha must be >= 0, "
+                f"got {self.search_length_norm_alpha}"
+            )
         if self.checkpoint_interval_tasks < 1:
             problems.append(
                 f"checkpoint_interval_tasks must be >= 1, "

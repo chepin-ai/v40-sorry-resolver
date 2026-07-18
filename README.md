@@ -50,10 +50,15 @@
 
 | provider（配置键） | 角色 | 职责 | 默认模型 |
 |---|---|---|---|
-| DeepSeek key1（`deepseek_a`） | **ORCHESTRATOR** | 规划 / 调度 / 协调 / 周期性评估指标并输出策略调整 JSON | `deepseek-chat` |
-| DeepSeek key2（`deepseek_b`） | **PROVER** | 主力证明生成（direct/search/agentic 提议）；`thinking=True` 时路由到 `deepseek-reasoner` | `deepseek-chat` |
+| DeepSeek key1（`deepseek_a`） | **ORCHESTRATOR** | 规划 / 调度 / 协调 / 周期性评估指标并输出策略调整 JSON | `deepseek-v4-flash` |
+| DeepSeek key2（`deepseek_b`） | **PROVER** | 主力证明生成（direct/search/agentic 提议）；`thinking=True` 时路由到 `deepseek-v4-pro` | `deepseek-v4-flash` |
 | Kimi（`kimi`） | **CRITIC** | 证明评审 / 互评估 / lesson 摘要 | `moonshot-v1-8k` |
 | LongCat（`longcat`） | **EXPLORER** | tactic 多样性采样 / 备选路线 | `LongCat-2.0` |
+
+> **DeepSeek V4 迁移（2026-07）**：旧别名 `deepseek-chat` / `deepseek-reasoner`
+> 于 **2026-07-24 正式退役**，新默认模型为真实存在的 `deepseek-v4-flash`（普通）
+> 与 `deepseek-v4-pro`（reasoning）。过渡期内健康检查为**两阶段探测**：新模型名
+> 探测失败时自动用旧别名再试一次，成功则沿用旧别名并打 WARNING 提醒迁移。
 
 无 key（或启动健康检查失败）的角色按 CRITIC→PROVER→EXPLORER→ORCHESTRATOR 链
 自动 fallback 并打 WARNING；4xx 连续 3 次熔断。启动时对所有 provider 做
@@ -67,8 +72,8 @@ chat 401 的假阳性），全部失败且未用 `--mock-llm` 时直接报错退
 | `DEEPSEEK_API_KEY` | DeepSeek key1 = ORCHESTRATOR | （空=禁用） |
 | `DEEPSEEK_API_KEY_2` | DeepSeek key2 = PROVER | （空=禁用） |
 | `DEEPSEEK_BASE_URL` | DeepSeek 端点 | `https://api.deepseek.com/v1` |
-| `DEEPSEEK_MODEL` | DeepSeek 聊天模型 | `deepseek-chat` |
-| `DEEPSEEK_REASONER_MODEL` | thinking 调用的推理模型 | `deepseek-reasoner` |
+| `DEEPSEEK_MODEL` | DeepSeek 聊天模型（V4 迁移后） | `deepseek-v4-flash` |
+| `DEEPSEEK_REASONER_MODEL` | thinking 调用的推理模型 | `deepseek-v4-pro` |
 | `KIMI_API_KEY` / `KIMI_BASE_URL` / `KIMI_MODEL` | CRITIC | `https://api.moonshot.cn/v1` / `moonshot-v1-8k` |
 | `LONGCAT_API_KEY` / `LONGCAT_BASE_URL` / `LONGCAT_MODEL` | EXPLORER | `https://api.longcat.chat/openai/v1` / `LongCat-2.0` |
 | `V40_VERIFIER` | 验证后端 `subprocess`/`dojo`/`mock` | `subprocess` |
@@ -133,6 +138,22 @@ v40_kaggle_bundle.main([
 
 任何相位的“成功”都必须再过一次统一 `verifier.verify_proof` 复核才入账——没有
 这条链路的“ solved”一律视为假阳性。
+
+## 前沿技术落点（2026-07 调研集成）
+
+下列各项均来自已核实的前沿调研（`frontier_atp.md` Top-8 / `frontier_resources.md`
+Top-5），全部为纯工程落地、默认**回归安全**（不改变默认行为或默认关闭）。变更明细
+见 `CHANGELOG.md`。
+
+| 技术 | 来源（收益证据） | 接入模块 | 开关 / 配置 |
+|---|---|---|---|
+| SorryDB 真实数据集接入（快照 JSON/JSONL，本地文件或远程 URL；pydantic 模型字段映射 repo/commit/file/line/goal） | SorryDB（arXiv:2603.02668，ICML 2026）；frontier_resources §1 | `sorrydb.py` `SorryDBClient` | `sorrydb_endpoint` 指向快照 URL 或本地文件；失败/空结果仅 WARNING 返回 `[]`，严禁注入假任务 |
+| SorryDB 防作弊验证协议：①该定理 sorry 数恰减 1 ②定理 statement 文本不变 ③`#print axioms` 无 sorryAx | SorryDB 论文 §5.1 验证协议 | `verify/subprocess_lean.py` | `V40Config.sorrydb_mode=True` 启用 ①②；③随 `check_axioms=True` 生效 |
+| Verifier 引导修复循环：失败时把 verifier 原始 Lean 诊断（截断 ~500 字符）连同 CRITIC lesson 注入下一轮 prompt；notebook 升级为 (lesson, raw_diagnostics) 对（≤3 条） | Goedel-V2 / SorryDB / APOLLO / Numina-Lean-Agent 四方互证：迭代纠错 ≫ 并行采样 | `engine/axprover.py` | 默认启用（agentic 相位内行为） |
+| 长度归一化 beam 打分：同优先级 tie-break 加 α·log L 罚项（L=累积 proof token 数） | BFS-Prover（arXiv:2502.03438，7B 纯 BFS 超 MCTS 系） | `engine/tactic_search.py` | `search_length_norm_alpha`（默认 0.1；**0 = 与旧行为完全一致**） |
+| 前提检索工具：leansearch.net（POST /search）+ premise-search.com（GET /api/search），top-k 引理注入 Critic/AxProver prompt；goal 含 mathlib 风格常量时才触发；8s 超时、失败降级 `[]`+WARNING 不阻塞 | LeanSearch v2（arXiv:2605.13137）；frontier_resources §4 | `engine/retrieval.py`（新），接线 `engine/agents.py` / `engine/axprover.py` / `engine/orchestrator.py` | `retrieval_enabled=True` 开启（默认关；构造 `PremiseRetriever(timeout_s=…)` 可调超时） |
+| 成本感知三档预算：predicted_steps ≤3 LIGHT / ≤8 STANDARD / >8 DEEP；`StrategyConfig.for_tier` 预设（LIGHT depth2/width1/iter3/no-thinking，STANDARD 现状默认，DEEP depth5/width3/iter10/thinking on） | Seed-Prover 三档 TTS + EconProver（pass>64 收益骤降） | `config.py` `BudgetTier`、`progress.py`、`engine/orchestrator.py` | 默认启用；OrchestratorLLM 动态调整仍优先于分档预设 |
+| DeepSeek V4 模型迁移：`deepseek-v4-flash` / `deepseek-v4-pro` 新默认；健康检查两阶段探测自动回退旧别名一次 | frontier_resources §6（旧别名 2026-07-24 退役，多聚合源一致） | `config.py`、`llm/client.py`、`llm/router.py`、`.env.example` | 默认启用；`DEEPSEEK_MODEL` / `DEEPSEEK_REASONER_MODEL` 可覆盖 |
 
 ## 局限性
 
