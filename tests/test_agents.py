@@ -70,6 +70,26 @@ async def test_review_proof_blacklist_short_circuits(make_task):
 
 
 @pytest.mark.asyncio
+async def test_review_proof_blacklist_strips_comments(make_task):
+    """N-12: the Critic judges like the verifier — 'sorry' inside a comment
+    must NOT trip the blacklist (word-boundary + comment-stripped)."""
+    client = FakeLLMClient(Role.CRITIC, script='{"approved": true, "reason": "ok"}')
+    critic = CriticAgent(FakeRouter({Role.CRITIC: client}))
+    approved, reason = await critic.review_proof(
+        make_task(0), "rfl -- closes the goal, no sorry here"
+    )
+    assert approved is True
+    assert len(client.calls) == 1  # reached the LLM review (not blocked locally)
+
+    # A real sorry outside comments is still blocked without any LLM call.
+    client2 = FakeLLMClient(Role.CRITIC, script='{"approved": true}')
+    critic2 = CriticAgent(FakeRouter({Role.CRITIC: client2}))
+    approved2, _ = await critic2.review_proof(make_task(0), "rfl\n  sorry")
+    assert approved2 is False
+    assert len(client2.calls) == 0
+
+
+@pytest.mark.asyncio
 async def test_review_proof_json_and_fallback(make_task):
     ok_client = FakeLLMClient(Role.CRITIC, script='{"approved": true, "reason": "clean"}')
     critic = CriticAgent(FakeRouter({Role.CRITIC: ok_client}))

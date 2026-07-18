@@ -461,7 +461,16 @@ class SubprocessLeanVerifier:
                     else:
                         link(Path(entry.path), dst, sub[1:])
                 else:
-                    os.symlink(entry.path, dst)
+                    try:
+                        os.symlink(entry.path, dst)
+                    except OSError:
+                        # Filesystems without symlink support (9p/portal
+                        # mounts, e.g. some /mnt sandboxes): fall back to a
+                        # real copy so work_dir may live there (BUG-7).
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.copytree(entry.path, dst, symlinks=False)
+                        else:
+                            shutil.copy2(entry.path, dst)
 
         link(base, run_dir, parts)
 

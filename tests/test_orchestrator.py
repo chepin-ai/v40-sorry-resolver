@@ -249,3 +249,91 @@ def test_strategy_from_config(base_config):
     assert s.tactic_search_depth == base_config.tactic_search_depth
     assert s.agentic_max_iterations == base_config.agentic_max_iterations
     assert s.phase_order == ["rfl", "direct", "search", "agentic"]
+
+
+@pytest.mark.asyncio
+async def test_metrics_recorded_and_report_by_provider(make_task, base_config):
+    """N-2 regression: task metrics must actually land in the collector
+    (record_task is awaited with duration_s=), and RunReport.counts_by_provider
+    is derived from the collector's per-provider llm series."""
+    from v40_sorry_resolver.metrics import MetricsCollector
+
+    metrics = MetricsCollector()
+    # Seed one provider call (clients record into this same collector in real
+    # runs); the report must surface it as counts_by_provider.
+    await metrics.record_llm_call(
+        provider="deepseek_b", model="deepseek-chat", latency_s=0.1,
+        prompt_tokens=3, completion_tokens=2,
+    )
+    cfg = base_config
+    cfg.num_workers = 2
+    router = FakeRouter(
+        {Role.PROVER: FakeLLMClient(Role.PROVER, script="VALID proof"),
+         Role.CRITIC: FakeLLMClient(Role.CRITIC)}
+    )
+    pipeline = _pipeline(cfg, router, FakeVerifier(), metrics=metrics)
+    report = await pipeline.run([make_task(0), make_task(1)], resume=False)
+
+    snap = await metrics.snapshot()
+    assert snap["tasks"]["processed"] == 2, snap["tasks"]
+    assert snap["tasks"]["succeeded"] == 2
+    assert snap["tasks"]["by_status"].get("SOLVED_LLM_DIRECT") == 2
+    assert report.counts_by_provider == {"deepseek_b": 1}
+
+
+@pytest.mark.asyncio
+async def test_mock_results_marked_unverified(make_task, base_config):
+    """N-5: with the mock verifier every result is labeled unverified and the
+    rendered summary carries the [UNVERIFIED] mark (SPEC 0.3/3.8)."""
+    from v40_sorry_resolver.verify.mock import MockVerifier
+
+    cfg = base_config
+    cfg.num_workers = 2
+    verifier = MockVerifier(cfg)
+    router = FakeRouter(
+        {Role.PROVER: FakeLLMClient(Role.PROVER, script="VALID proof"),
+         Role.CRITIC: FakeLLMClient(Role.CRITIC)}
+    )
+    pipeline = _pipeline(cfg, router, verifier)
+    report = await pipeline.run([make_task(0), make_task(1)], resume=False)
+
+    assert report.solved == 2  # mock 'VALID' marker passes
+    assert all(r["unverified"] for r in report.results)
+    assert "[UNVERIFIED]" in report.render_summary()
+
+
+@pytest.mark.asyncio
+async def test_real_verifier_results_not_unverified(make_task, base_config):
+    """Counterpart of N-5: a non-mock verifier must NOT set unverified."""
+    cfg = base_config
+    cfg.num_workers = 2
+    router = FakeRouter(
+        {Role.PROVER: FakeLLMClient(Role.PROVER, script="VALID proof"),
+         Role.CRITIC: FakeLLMClient(Role.CRITIC)}
+    )
+    pipeline = _pipeline(cfg, router, FakeVerifier())
+    report = await pipeline.run([make_task(0)], resume=False)
+    assert report.solved == 1
+    assert not any(r["unverified"] for r in report.results)
+    assert "[UNVERIFIED]" not in report.render_summary()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_metrics_is_json_snapshot(make_task, base_config, tmp_path):
+    """N-7 regression: the checkpoint's metrics field must be a JSON dict
+    snapshot, not a '<MetricsCollector object at 0x...>' repr."""
+    cfg = base_config
+    cfg.num_workers = 2
+    cp_path = str(tmp_path / "cp.json")
+    router = FakeRouter(
+        {Role.PROVER: FakeLLMClient(Role.PROVER, script="VALID proof"),
+         Role.CRITIC: FakeLLMClient(Role.CRITIC)}
+    )
+    pipeline = _pipeline(cfg, router, FakeVerifier(), checkpoint=Checkpoint(cp_path))
+    await pipeline.run([make_task(0)], resume=False)
+
+    with open(cp_path, encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert isinstance(saved["metrics"], dict)
+    assert "MetricsCollector object" not in json.dumps(saved["metrics"])
+    assert saved["metrics"]["tasks"]["processed"] == 1

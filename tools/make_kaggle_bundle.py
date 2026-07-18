@@ -30,6 +30,13 @@ base64 zip. On import of ``main()`` it unpacks to
 ``/kaggle/working/v40_src`` (fallback ``./v40_src`` when /kaggle is absent)
 and dispatches to the package CLI.
 
+DEPENDENCY BOOTSTRAP (run once per Kaggle session; the bundle embeds only
+this package, not third-party libraries):
+    !pip install -q "openai>=2.46,<3" "httpx>=0.28,<1"
+A missing dependency fails fast with an explicit install hint. The real
+verification path additionally needs the Lean 4 toolchain (elan + lake)
+installed in the image (see README.md "Kaggle 部署指南").
+
 Kaggle 12h budget mapping (SPEC 3.13 / README):
     wall_clock_budget_s = 36000 (10h, keep 2h headroom), num_workers = 16.
 Run in a Kaggle notebook cell:
@@ -68,7 +75,14 @@ def unpack_bundle(dest_root=None):
 
 def main(argv=None):
     src = unpack_bundle()
-    from v40_sorry_resolver.cli import main as cli_main
+    try:
+        from v40_sorry_resolver.cli import main as cli_main
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            f"v40 bundle: missing dependency {exc.name!r}. Install the runtime "
+            'dependencies first: pip install "openai>=2.46,<3" "httpx>=0.28,<1" '
+            "(see requirements.txt / README.md)"
+        )
 
     return cli_main(argv)
 

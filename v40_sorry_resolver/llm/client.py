@@ -73,12 +73,18 @@ class LLMResponse:
 class AsyncLLMClient:
     """Async client for one OpenAI-compatible provider."""
 
-    def __init__(self, cfg: LLMProviderConfig, cache=None) -> None:
+    def __init__(self, cfg: LLMProviderConfig, cache=None, metrics=None) -> None:
         self.cfg = cfg
         self.cache = cache
+        # Injected collector shared with the pipeline (N-2/BUG-4); when None,
+        # the process-wide global collector is used at record time.
+        self._metrics = metrics
         # Router overridables (kept in sync with V40Config by from_config).
         self.default_temperature = DEFAULT_TEMPERATURE
         self.thinking_max_tokens = 2048
+        # Reasoning model used for thinking=True calls when the router wires
+        # one (SPEC 3.3 reasoning-model routing); None = keep cfg.model.
+        self.reasoner_model: Optional[str] = None
         self._client = AsyncOpenAI(
             base_url=cfg.base_url,
             api_key=cfg.api_key or "unset",
@@ -114,6 +120,16 @@ class AsyncLLMClient:
         temp = temperature if temperature is not None else self.default_temperature
         model = self.cfg.model
 
+        if thinking:
+            timeout_s = max(self.cfg.thinking_timeout_s, MIN_THINKING_TIMEOUT_S)
+            max_tokens = min(max_tokens, self.thinking_max_tokens)
+            if self.reasoner_model:
+                # Reasoning-model routing (SPEC 3.3): thinking calls go to the
+                # reasoner model wired by the router (e.g. deepseek-reasoner).
+                model = self.reasoner_model
+        else:
+            timeout_s = self.cfg.timeout_s
+
         if self._breaker_open:
             return await self._error_response(
                 "breaker_open: provider disabled after "
@@ -141,12 +157,6 @@ class AsyncLLMClient:
                     error=None,
                 )
                 return cached
-
-        if thinking:
-            timeout_s = max(self.cfg.thinking_timeout_s, MIN_THINKING_TIMEOUT_S)
-            max_tokens = min(max_tokens, self.thinking_max_tokens)
-        else:
-            timeout_s = self.cfg.timeout_s
 
         messages = []
         if system_prompt:
@@ -209,31 +219,40 @@ class AsyncLLMClient:
 
     # ------------------------------------------------------------------
     async def health_check(self) -> bool:
-        """Return True if the provider responds; 4xx -> False.
+        """Return True iff the provider can actually generate; else False.
+
+        Liveness is proven with a real 1-token chat completion probe — a
+        200 on ``GET /models`` alone is NOT sufficient (benchmark BUG-3:
+        LongCat served /models but returned 401 on every chat completion).
+        Falls back to ``/models`` only when the chat endpoint answers 404
+        (providers without a chat-completions route).
 
         A successful health check resets the circuit breaker.
         """
         try:
-            await self._client.models.list()
+            await self._client.chat.completions.create(
+                model=self.cfg.model,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+                timeout=self.cfg.timeout_s,
+            )
         except Exception as exc:
             kind, status = self._classify_error(exc)
             if kind == "client_error" and status == 404:
-                # Some providers do not expose /models; fall back to a
-                # 1-token chat probe (SPEC 3.3).
+                # No chat-completions route: secondary evidence via /models.
                 try:
-                    await self._client.chat.completions.create(
-                        model=self.cfg.model,
-                        messages=[{"role": "user", "content": "ping"}],
-                        max_tokens=1,
-                        timeout=self.cfg.timeout_s,
-                    )
+                    await self._client.models.list()
                 except Exception as exc2:
                     logger.warning(
-                        "health_check '%s' chat probe failed: %s", self.cfg.name, exc2
+                        "health_check '%s' /models fallback failed: %s",
+                        self.cfg.name,
+                        exc2,
                     )
                     return False
             else:
-                logger.warning("health_check '%s' failed: %s", self.cfg.name, exc)
+                logger.warning(
+                    "health_check '%s' chat probe failed: %s", self.cfg.name, exc
+                )
                 return False
         self._breaker_open = False
         self._consecutive_4xx = 0
@@ -408,7 +427,10 @@ class AsyncLLMClient:
 
     async def _record_metrics(self, **kwargs) -> None:
         try:
-            await get_global_metrics().record_llm_call(
+            collector = (
+                self._metrics if self._metrics is not None else get_global_metrics()
+            )
+            await collector.record_llm_call(
                 provider=self.cfg.name, model=self.cfg.model, **kwargs
             )
         except Exception:

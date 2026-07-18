@@ -54,10 +54,10 @@ class TestFromEnv:
         assert cfg.providers["deepseek_b"].model == "deepseek-chat"
         assert cfg.providers["kimi"].model == "moonshot-v1-8k"
         assert cfg.providers["kimi"].base_url == "https://api.moonshot.cn/v1"
-        assert cfg.providers["longcat"].model == "LongCat-Flash-Chat"
+        assert cfg.providers["longcat"].model == "LongCat-2.0"
         assert (
             cfg.providers["longcat"].base_url
-            == "https://api.longcat.chat/openapi/v1"
+            == "https://api.longcat.chat/openai/v1"
         )
         assert cfg.deepseek_reasoner_model == "deepseek-reasoner"
 

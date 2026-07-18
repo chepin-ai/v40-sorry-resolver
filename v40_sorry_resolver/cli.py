@@ -202,6 +202,11 @@ async def async_main(args: argparse.Namespace) -> int:
     for prob in problems:
         logger.warning("config: %s", prob)
 
+    # One MetricsCollector shared by the router's clients and the pipeline
+    # (N-2/BUG-4: previously the pipeline used a fresh collector while clients
+    # recorded into the global one, so run metrics were always empty).
+    metrics = MetricsCollector()
+
     if args.mock_llm:
         if _has_real_keys(cfg):
             logger.warning(
@@ -213,11 +218,11 @@ async def async_main(args: argparse.Namespace) -> int:
         cache_for_router = _construct(
             Cache, (os.path.join(cfg.work_dir, "cache.db"),), (cfg.work_dir,), ()
         )
-        router = MultiLLMRouter.from_config(cfg, cache_for_router)
+        router = MultiLLMRouter.from_config(cfg, cache_for_router, metrics=metrics)
 
     # Task source.
     scanner = _construct(SorryScanner, (cfg,), (cfg.lean_project_paths,), ())
-    tasks = await maybe_await(scanner.scan())
+    tasks = await maybe_await(scanner.scan(cfg.lean_project_paths))
     if not tasks:
         logger.warning("no sorry tasks found in %s", cfg.lean_project_paths)
     else:
@@ -233,6 +238,23 @@ async def async_main(args: argparse.Namespace) -> int:
             )
         print(f"[dry-run] llm health: {health}")
         return 0
+
+    if not args.mock_llm:
+        # Startup health gate (SPEC 0.2, N-4/BUG-3): probe every provider
+        # with a real 1-token chat completion *before* solving. The router
+        # disables failing providers; if nothing survives, refuse to run.
+        health = await router.health_check_all()
+        for name, ok in health.items():
+            if not ok:
+                logger.warning(
+                    "provider '%s' failed the startup health check; disabled", name
+                )
+        if not health or not any(health.values()):
+            logger.error(
+                "no LLM provider passed the startup health check; aborting "
+                "(check API keys/endpoints in .env, or use --mock-llm for tests)"
+            )
+            return 2
 
     # Priority prediction (LeanProgress-v2).
     try:
@@ -251,7 +273,6 @@ async def async_main(args: argparse.Namespace) -> int:
     checkpoint = _construct(
         Checkpoint, (os.path.join(cfg.work_dir, "checkpoint.json"),), (cfg.work_dir,), ()
     )
-    metrics = MetricsCollector()
     verifier = build_verifier(cfg)
 
     try:

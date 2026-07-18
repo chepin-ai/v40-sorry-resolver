@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from conftest import FakeLLMClient, FakeRouter, FakeVerifier
@@ -123,3 +125,50 @@ async def test_thinking_budget_used_when_enabled(make_task):
     prover = router.client(Role.PROVER)
     assert prover.calls[0]["thinking"] is True
     assert prover.calls[0]["max_tokens"] == strategy.thinking_max_tokens
+
+
+@pytest.mark.asyncio
+async def test_notebook_isolated_across_concurrent_tasks(make_task):
+    """N-3 regression: ONE shared AxProverV2, two CONCURRENT solves — a lesson
+    learned on task A must never leak into task B's propose prompts."""
+    seen_prompts: dict[str, list[str]] = {"theorem_0": [], "theorem_1": []}
+    attempts: dict[str, int] = {"theorem_0": 0, "theorem_1": 0}
+
+    def prover_script(prompt, system_prompt, role, idx):
+        name = "theorem_0" if "Theorem theorem_0" in prompt else "theorem_1"
+        seen_prompts[name].append(prompt)
+        attempts[name] += 1
+        # First attempt per task fails verification, the second succeeds.
+        return "junk proof" if attempts[name] == 1 else "VALID proof"
+
+    def critic_script(prompt, system_prompt, role, idx):
+        blob = f"{system_prompt or ''} {prompt}"
+        if "review" in blob.lower():
+            return '{"approved": true, "reason": "ok"}'
+        # Lesson names the failed task (unique cross-contamination marker).
+        name = "theorem_0" if "Theorem theorem_0" in blob else "theorem_1"
+        return f"direction: avoid the {name} mistake"
+
+    router = FakeRouter(
+        {
+            Role.PROVER: FakeLLMClient(Role.PROVER, script=prover_script, delay=0.01),
+            Role.CRITIC: FakeLLMClient(Role.CRITIC, script=critic_script, delay=0.01),
+        }
+    )
+    solver = AxProverV2(router, FakeVerifier(), cfg=None)  # shared instance
+    r0, r1 = await asyncio.gather(
+        solver.solve(make_task(0), _strategy(max_iter=3)),
+        solver.solve(make_task(1), _strategy(max_iter=3)),
+    )
+    assert r0.success and r1.success
+
+    # Each task's second prompt carries its OWN lesson...
+    assert any(
+        "avoid the theorem_0 mistake" in p for p in seen_prompts["theorem_0"][1:]
+    )
+    assert any(
+        "avoid the theorem_1 mistake" in p for p in seen_prompts["theorem_1"][1:]
+    )
+    # ...and NEVER the other task's lesson (the pre-fix pollution).
+    assert "theorem_1 mistake" not in "\n".join(seen_prompts["theorem_0"])
+    assert "theorem_0 mistake" not in "\n".join(seen_prompts["theorem_1"])

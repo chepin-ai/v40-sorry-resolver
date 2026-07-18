@@ -22,11 +22,14 @@ from typing import Any, Optional
 
 from v40_sorry_resolver.models import SorryTask
 from v40_sorry_resolver.llm.router import Role
+# Reuse the verify layer's comment stripper + word-boundary blacklist so the
+# Critic judges exactly like the verifier (N-12: a proof whose comment says
+# `-- no sorry here` was wrongly rejected by the Critic).
+from v40_sorry_resolver.verify.subprocess_lean import _BLACKLIST_RE, _strip_comments
 
 logger = logging.getLogger("v40.agents")
 
 _LESSON_CHARS = 200
-_BLACKLIST_RE = re.compile(r"\b(sorry|admit|stop)\b")
 
 # evaluate_and_adjust JSON schema (SPEC 3.12) with clamp ranges.
 _ADJUST_SCHEMA = (
@@ -106,7 +109,7 @@ class CriticAgent:
     async def review_proof(self, task: SorryTask, proof: str) -> tuple[bool, str]:
         """Cross-review a verified proof: local blacklist re-check + LLM review."""
         # Local blacklist re-check first (defense in depth, no LLM needed).
-        if _BLACKLIST_RE.search(proof or ""):
+        if _BLACKLIST_RE.search(_strip_comments(proof or "")):
             return False, "blacklist: proof contains sorry/admit/stop"
         system = (
             "You are a strict Lean 4 proof reviewer. Reply with JSON only: "
@@ -310,12 +313,21 @@ class _NullConfig:
 
 class EmergenceLog:
     """Emergent-behavior observability: strategy adjustments, role
-    contributions, cross-eval agreement rate. Persisted as JSONL."""
+    contributions, cross-eval agreement rate. Persisted as JSONL.
+
+    Disk writes are BATCHED (N-10): ``record`` only appends to an in-memory
+    pending buffer; lines are flushed every ``_FLUSH_EVERY`` events or on an
+    explicit ``flush()`` (the pipeline flushes at run end), keeping
+    synchronous file IO off the event-loop hot path.
+    """
+
+    _FLUSH_EVERY = 32
 
     def __init__(self, work_dir: Optional[str] = None):
         self.events: list[dict] = []
         self._lock = threading.Lock()
         self._path: Optional[str] = None
+        self._pending: list[str] = []
         if work_dir:
             try:
                 results_dir = os.path.join(work_dir, "results")
@@ -332,11 +344,24 @@ class EmergenceLog:
         with self._lock:
             self.events.append(event)
             if self._path:
-                try:
-                    with open(self._path, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-                except Exception as exc:
-                    logger.debug("emergence write failed: %s", exc)
+                self._pending.append(json.dumps(event, ensure_ascii=False, default=str))
+                if len(self._pending) >= self._FLUSH_EVERY:
+                    self._flush_locked()
+
+    def flush(self) -> None:
+        """Write any buffered events to disk (safe to call anytime)."""
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if not self._path or not self._pending:
+            return
+        try:
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(self._pending) + "\n")
+            self._pending.clear()
+        except Exception as exc:
+            logger.debug("emergence flush failed: %s", exc)
 
     def strategy_adjustment(self, old: dict, new: dict, rationale: str) -> None:
         self.record(
@@ -364,6 +389,7 @@ class EmergenceLog:
         return sum(1 for e in evals if e.get("agree")) / len(evals)
 
     def summary(self) -> dict:
+        self.flush()  # readers of the JSONL expect it complete up to now
         roles: dict[str, dict[str, int]] = {}
         for e in self.events:
             if e.get("kind") != "role_contribution":

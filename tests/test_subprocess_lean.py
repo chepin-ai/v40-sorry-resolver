@@ -286,3 +286,77 @@ async def test_dojo_verifier_fails_loudly(config):
     assert isinstance(v, LeanDojoVerifier)
     with pytest.raises(DojoUnavailableError):
         await v.init()
+
+
+# ---------------------------------------------------------------------------
+# BUG-2 regression: theorem-shell extraction + splice. TOOLCHAIN-FREE — these
+# tests exercise extract_lean_code/_splice text logic only (no lake needed),
+# so they also run in containers without a Lean toolchain.
+# ---------------------------------------------------------------------------
+from v40_sorry_resolver.engine import extract_lean_code  # noqa: E402
+
+# Real DeepSeek-style outputs observed in the T1 benchmark (the model wraps
+# the proof in the full theorem header even when asked for bare tactics).
+DEEPSEEK_AND_COMM = (
+    "```lean\n"
+    "theorem and_comm_simple (a b : Prop) (h : a ∧ b) : b ∧ a := by\n"
+    "  exact ⟨h.2, h.1⟩\n"
+    "```"
+)
+DEEPSEEK_OR_INTRO = (
+    "```lean\n"
+    "theorem or_intro_simple (p q : Prop) (h : p) : p ∨ q := by\n"
+    "  exact Or.inl h\n"
+    "```"
+)
+
+
+def test_extract_strips_theorem_shell_multiline():
+    assert extract_lean_code(DEEPSEEK_AND_COMM) == "by\n  exact ⟨h.2, h.1⟩"
+    assert extract_lean_code(DEEPSEEK_OR_INTRO) == "by\n  exact Or.inl h"
+
+
+def test_extract_strips_theorem_shell_single_line():
+    text = "```lean\ntheorem nat_refl (n : Nat) : n = n := by rfl\n```"
+    assert extract_lean_code(text) == "by rfl"
+
+
+def test_extract_strips_unfenced_theorem_shell():
+    text = "theorem one_plus_one : 1 + 1 = 2 := by\n  rfl"
+    assert extract_lean_code(text) == "by\n  rfl"
+
+
+def test_extract_term_shell_becomes_exact():
+    text = "```lean\ntheorem one_plus_one : 1 + 1 = 2 := rfl\n```"
+    assert extract_lean_code(text) == "exact rfl"
+
+
+def test_extract_plain_tactics_unchanged():
+    assert extract_lean_code("```lean\nrfl\n```") == "rfl"
+    assert extract_lean_code("induction n with\n  | zero => rfl") == (
+        "induction n with\n  | zero => rfl"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_stripped_proof_splices_cleanly(config, mini_tasks):
+    """End-to-end text path (no toolchain): DeepSeek shell output -> extract
+    -> splice into the mini project. The spliced file must contain the proof
+    body in the tactic slot and no duplicated `theorem` header."""
+    v = SubprocessLeanVerifier(config)  # no init(): pure text splice only
+    try:
+        by = _by_name(mini_tasks)
+        for name, sample, body in [
+            ("and_comm_simple", DEEPSEEK_AND_COMM, "exact ⟨h.2, h.1⟩"),
+            ("or_intro_simple", DEEPSEEK_OR_INTRO, "exact Or.inl h"),
+        ]:
+            proof = extract_lean_code(sample)
+            assert "theorem" not in proof  # shell is gone before splicing
+            assert not v._blacklist_hit(proof)
+            content, decl_line1 = v._splice(by[name], proof)
+            assert content.count(f"theorem {name}") == 1
+            assert body in content
+            assert ":= by\n  theorem" not in content  # the BUG-2 poison pattern
+            assert decl_line1 >= 1
+    finally:
+        await v.close()

@@ -139,6 +139,11 @@ class MetricsCollector:
         return {
             "uptime_s": time.time() - self._started_at,
             "llm": llm_out,
+            # Flat provider -> calls aggregation (SPEC 3.10.6 "counts by
+            # provider"); this is the key RunReport.counts_by_provider reads.
+            "by_provider": {
+                provider: row["calls"] for provider, row in llm_out.items()
+            },
             "tasks": {
                 "processed": processed,
                 "succeeded": self._tasks_succeeded,

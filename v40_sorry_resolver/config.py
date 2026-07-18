@@ -25,8 +25,10 @@ _DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
 _DEFAULT_DEEPSEEK_REASONER_MODEL = "deepseek-reasoner"
 _DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1"
 _DEFAULT_KIMI_MODEL = "moonshot-v1-8k"
-_DEFAULT_LONGCAT_BASE_URL = "https://api.longcat.chat/openapi/v1"
-_DEFAULT_LONGCAT_MODEL = "LongCat-Flash-Chat"
+# T1-verified working values (benchmark BUG-6): the old `openapi/v1` endpoint
+# 404s and `LongCat-Flash-Chat` is retired; only `LongCat-2.0` is served.
+_DEFAULT_LONGCAT_BASE_URL = "https://api.longcat.chat/openai/v1"
+_DEFAULT_LONGCAT_MODEL = "LongCat-2.0"
 
 #: Thinking calls get a dedicated timeout floor (SPEC: >= 240s).
 MIN_THINKING_TIMEOUT_S = 240.0

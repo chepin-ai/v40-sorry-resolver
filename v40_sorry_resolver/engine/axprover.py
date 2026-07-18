@@ -42,7 +42,8 @@ class AxProverV2:
         self.metrics = metrics
         self.cfg = cfg
         self.emergence = emergence
-        # Bounded notebook: last 3 lessons, each <=200 chars.
+        # Introspection mirror of the LAST completed solve's notebook only;
+        # the working notebook is a solve() local (per-task isolation, N-3).
         self.notebook: list[str] = []
 
     def _stall_patience(self) -> int:
@@ -54,6 +55,10 @@ class AxProverV2:
         patience = max(1, self._stall_patience())
         prover = self.router.client(Role.PROVER)
 
+        # Per-task notebook (N-3): local state, bounded to the last
+        # _MAX_LESSONS lessons of <=200 chars; never shared across tasks.
+        notebook: list[str] = []
+
         tokens_used = 0
         iterations = 0
         best_remaining: Optional[int] = None
@@ -62,17 +67,19 @@ class AxProverV2:
 
         for i in range(max_iter):
             iterations = i + 1
-            proof, toks, llm_error = await self._propose(task, prover, strategy)
+            proof, toks, llm_error = await self._propose(task, prover, strategy, notebook)
             tokens_used += toks
             if llm_error is not None:
                 last_error = llm_error
-                await self._add_lesson(task, "", llm_error)
+                await self._add_lesson(task, "", llm_error, notebook)
                 if i - last_improve_iter >= patience:
                     break
                 continue
             if not proof:
                 last_error = "empty proof"
-                await self._add_lesson(task, "", "empty proof extracted from LLM reply")
+                await self._add_lesson(
+                    task, "", "empty proof extracted from LLM reply", notebook
+                )
                 if i - last_improve_iter >= patience:
                     break
                 continue
@@ -81,7 +88,7 @@ class AxProverV2:
                 vr = await self.verifier.verify_proof(task, proof)
             except Exception as exc:
                 last_error = f"verifier error: {exc}"
-                await self._add_lesson(task, proof, last_error)
+                await self._add_lesson(task, proof, last_error, notebook)
                 if i - last_improve_iter >= patience:
                     break
                 continue
@@ -98,6 +105,7 @@ class AxProverV2:
                 if self.emergence is not None:
                     self.emergence.cross_eval(task.id, agree=bool(approved))
                 if approved:
+                    self.notebook = list(notebook)  # introspection mirror
                     return ResolutionResult(
                         task_id=task.id,
                         success=True,
@@ -111,13 +119,13 @@ class AxProverV2:
                         verification_passed=True,  # grounded in vr.ok above
                     )
                 last_error = f"critic rejected: {note}"
-                self._push_lesson(f"critic: {note}"[:_LESSON_CHARS])
+                self._push_lesson(notebook, f"critic: {note}"[:_LESSON_CHARS])
             else:
                 diagnostics = getattr(vr, "diagnostics", "") or getattr(
                     vr, "error", ""
                 ) or "verification failed"
                 last_error = str(diagnostics)[:300]
-                await self._add_lesson(task, proof, str(diagnostics))
+                await self._add_lesson(task, proof, str(diagnostics), notebook)
 
             # Stall semantics (v39 P1-2 fix): consecutive rounds without
             # remaining_sorries improvement.
@@ -130,6 +138,7 @@ class AxProverV2:
                 )
                 break
 
+        self.notebook = list(notebook)  # introspection mirror
         return ResolutionResult(
             task_id=task.id,
             success=False,
@@ -145,7 +154,7 @@ class AxProverV2:
 
     # ------------------------------------------------------------ internals
 
-    async def _propose(self, task: SorryTask, prover, strategy):
+    async def _propose(self, task: SorryTask, prover, strategy, notebook: list[str]):
         thinking = bool(getattr(strategy, "enable_thinking", False))
         max_tokens = (
             int(getattr(strategy, "thinking_max_tokens", 2048))
@@ -153,9 +162,9 @@ class AxProverV2:
             else 2048
         )
         lessons_block = ""
-        if self.notebook:
+        if notebook:
             lessons_block = "Recent lessons (avoid repeating these mistakes):\n" + "\n".join(
-                f"- {l}" for l in self.notebook[-_MAX_LESSONS:]
+                f"- {l}" for l in notebook[-_MAX_LESSONS:]
             )
         prompt = (
             f"Theorem {task.theorem_name} (file {task.file_path}, "
@@ -187,13 +196,16 @@ class AxProverV2:
         )
         return extract_lean_code(getattr(resp, "text", "") or ""), tokens, None
 
-    async def _add_lesson(self, task: SorryTask, proof: str, diagnostics: str) -> None:
+    async def _add_lesson(
+        self, task: SorryTask, proof: str, diagnostics: str, notebook: list[str]
+    ) -> None:
         try:
             lesson = await self.critic.summarize_lesson(task, proof, diagnostics)
         except Exception as exc:
             lesson = f"unknown: critic unavailable ({exc})"
-        self._push_lesson(lesson)
+        self._push_lesson(notebook, lesson)
 
-    def _push_lesson(self, lesson: str) -> None:
-        self.notebook.append(str(lesson)[:_LESSON_CHARS])
-        del self.notebook[:-_MAX_LESSONS]
+    @staticmethod
+    def _push_lesson(notebook: list[str], lesson: str) -> None:
+        notebook.append(str(lesson)[:_LESSON_CHARS])
+        del notebook[:-_MAX_LESSONS]

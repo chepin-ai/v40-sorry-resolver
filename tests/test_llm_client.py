@@ -69,6 +69,11 @@ class FakeAsyncOpenAI:
         self.chat.completions.create = AsyncMock(return_value=make_completion())
         self.models = MagicMock()
         if "fail" in str(kwargs.get("base_url", "")):
+            # Health checks probe chat completions first (BUG-3), so a dead
+            # provider must fail the generation probe, not just /models.
+            self.chat.completions.create = AsyncMock(
+                side_effect=make_status_error(401)
+            )
             self.models.list = AsyncMock(side_effect=make_status_error(401))
         else:
             self.models.list = AsyncMock(return_value=SimpleNamespace(data=[]))
@@ -290,8 +295,44 @@ class TestRetryAndBreaker:
 
     async def test_health_check_4xx_returns_false(self, fake_openai):
         client = make_client()
-        FakeAsyncOpenAI.instances[0].models.list.side_effect = (
-            make_status_error(401)
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(401)
+        assert await client.health_check() is False
+
+    async def test_health_check_models_ok_but_chat_401_is_unhealthy(
+        self, fake_openai
+    ):
+        """BUG-3 regression (LongCat): /models answers 200 while every chat
+        completion 401s — the provider must be judged UNHEALTHY."""
+        client = make_client()
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(401)
+        # /models succeeds (the false-positive the old logic fell for).
+        assert await client.health_check() is False
+
+    async def test_health_check_chat_probe_success_no_models_needed(
+        self, fake_openai
+    ):
+        client = make_client()
+        models_list = FakeAsyncOpenAI.instances[0].models.list
+        models_list.side_effect = AssertionError("/models must not be called")
+        assert await client.health_check() is True
+
+    async def test_health_check_chat_404_falls_back_to_models(self, fake_openai):
+        client = make_client()
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(404)
+        # /models succeeds -> provider without a chat route is still alive.
+        assert await client.health_check() is True
+
+    async def test_health_check_chat_404_and_models_down_is_unhealthy(
+        self, fake_openai
+    ):
+        client = make_client()
+        create = FakeAsyncOpenAI.instances[0].chat.completions.create
+        create.side_effect = make_status_error(404)
+        FakeAsyncOpenAI.instances[0].models.list.side_effect = make_status_error(
+            401
         )
         assert await client.health_check() is False
 
@@ -343,6 +384,81 @@ class TestClose:
         await client.close()
         await client.close()
         assert FakeAsyncOpenAI.instances[0].close.call_count == 1
+
+
+class TestReasonerRouting:
+    async def test_thinking_uses_reasoner_model_when_wired(self, fake_openai):
+        client = make_client()
+        client.reasoner_model = "deepseek-reasoner"
+        await client.generate("x", thinking=True)
+        call = FakeAsyncOpenAI.instances[0].chat.completions.create.call_args
+        assert call.kwargs["model"] == "deepseek-reasoner"
+        assert call.kwargs["timeout"] == 300.0
+
+    async def test_non_thinking_keeps_chat_model(self, fake_openai):
+        client = make_client()
+        client.reasoner_model = "deepseek-reasoner"
+        await client.generate("x", thinking=False)
+        call = FakeAsyncOpenAI.instances[0].chat.completions.create.call_args
+        assert call.kwargs["model"] == "test-model"
+
+    async def test_no_reasoner_wired_keeps_chat_model(self, fake_openai):
+        client = make_client()
+        await client.generate("x", thinking=True)
+        call = FakeAsyncOpenAI.instances[0].chat.completions.create.call_args
+        assert call.kwargs["model"] == "test-model"
+
+    async def test_router_wires_reasoner_for_deepseek_only(
+        self, fake_openai, tmp_path
+    ):
+        cfg = router_config(tmp_path)
+        cfg.deepseek_reasoner_model = "deepseek-reasoner"
+        router = MultiLLMRouter.from_config(cfg)
+        assert (
+            router.client(Role.PROVER).reasoner_model == "deepseek-reasoner"
+        )
+        assert (
+            router.client(Role.ORCHESTRATOR).reasoner_model
+            == "deepseek-reasoner"
+        )
+        assert router.client(Role.CRITIC).reasoner_model is None
+        assert router.client(Role.EXPLORER).reasoner_model is None
+        await router.close()
+
+
+class TestMetricsInjection:
+    async def test_injected_collector_receives_calls(self, fake_openai):
+        from v40_sorry_resolver.metrics import MetricsCollector
+
+        collector = MetricsCollector()
+        client = AsyncLLMClient(make_cfg(), metrics=collector)
+        await client.generate("a")
+        await client.generate("b")
+        snap = await collector.snapshot()
+        assert snap["llm"]["testprov"]["calls"] == 2
+        assert snap["by_provider"] == {"testprov": 2}
+        # The global collector stays untouched (no split accounting).
+        global_snap = await get_global_metrics().snapshot()
+        assert global_snap["llm"] == {}
+
+    async def test_router_from_config_shares_collector(self, fake_openai, tmp_path):
+        from v40_sorry_resolver.metrics import MetricsCollector
+
+        collector = MetricsCollector()
+        router = MultiLLMRouter.from_config(router_config(tmp_path), metrics=collector)
+        await router.client(Role.PROVER).generate("prove")
+        await router.client(Role.CRITIC).generate("review")
+        snap = await collector.snapshot()
+        assert snap["llm"]["deepseek_b"]["calls"] == 1
+        assert snap["llm"]["kimi"]["calls"] == 1
+        assert snap["by_provider"] == {"deepseek_b": 1, "kimi": 1}
+        await router.close()
+
+    async def test_default_falls_back_to_global_collector(self, fake_openai):
+        client = make_client()
+        await client.generate("a")
+        snap = await get_global_metrics().snapshot()
+        assert snap["llm"]["testprov"]["calls"] == 1
 
 
 # ----------------------------------------------------------------------

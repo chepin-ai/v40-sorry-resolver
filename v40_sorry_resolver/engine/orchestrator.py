@@ -134,6 +134,10 @@ class RunReport:
         ]
         if self.counts_by_provider:
             lines.append(f"by_provider: {self.counts_by_provider}")
+        if any(r.get("unverified") for r in self.results):
+            lines.append(
+                "[UNVERIFIED] mock verifier was used; solved counts are not real"
+            )
         if self.untouched:
             lines.append(f"untouched({len(self.untouched)}): {self.untouched[:10]}")
         return "\n".join(lines)
@@ -241,6 +245,9 @@ class ResolutionPipeline:
         self._start_wall = time.time()
         self._start_loop = asyncio.get_running_loop().time()
         self._tasks = list(tasks)
+        # Evaluation cadence starts now (not at t=0) so the first completed
+        # task does not immediately trigger an empty-metrics evaluation.
+        self._last_eval_ts = time.monotonic()
         self._install_signal_handlers()
         try:
             if resume:
@@ -312,6 +319,10 @@ class ResolutionPipeline:
             return report
         finally:
             self._remove_signal_handlers()
+            try:
+                self.emergence.flush()
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     def request_shutdown(self) -> None:
         """Public shutdown trigger (CLI / tests)."""
@@ -751,7 +762,18 @@ class ResolutionPipeline:
             self._axiom_quota(),
         )
 
+    def _mock_verifier_active(self) -> bool:
+        """True when results come from the mock path (SPEC 3.8 -> UNVERIFIED)."""
+        return bool(
+            getattr(self.verifier, "is_mock", False)
+            or getattr(self.cfg, "verifier", "") == "mock"
+        )
+
     async def _account(self, task: SorryTask, result: ResolutionResult) -> None:
+        if self._mock_verifier_active():
+            # Mock-verified results are never real; label them so reports and
+            # run json can mark them [UNVERIFIED] (N-5, SPEC 0.3/3.8).
+            result.unverified = True
         if not result.success and result.status not in (
             ProofStatus.OPEN,  # interrupted by shutdown: keep OPEN for resume
         ):
@@ -767,7 +789,7 @@ class ResolutionPipeline:
         task.attempts = task.attempts[-20:]
 
         self._recent_durations.append(result.time_elapsed)
-        self._record_metrics(task, result)
+        await self._record_metrics(task, result)
         self.emergence.record(
             "task_done",
             task_id=task.id,
@@ -829,17 +851,21 @@ class ResolutionPipeline:
             "orchestrator": "ORCHESTRATOR",
         }.get(solver, solver or "unknown")
 
-    def _record_metrics(self, task: SorryTask, result: ResolutionResult) -> None:
+    async def _record_metrics(self, task: SorryTask, result: ResolutionResult) -> None:
         if self.metrics is None:
             return
         try:
-            self.metrics.record_task(
-                task_id=task.id,
-                status=result.status.name,
-                solver=result.solver,
-                success=result.success,
-                tokens_used=result.tokens_used,
-                time_elapsed=result.time_elapsed,
+            # Aligned with MetricsCollector.record_task (duration_s=); the
+            # coroutine must be awaited or nothing is ever recorded (N-2).
+            await maybe_await(
+                self.metrics.record_task(
+                    task_id=task.id,
+                    status=result.status.name,
+                    solver=result.solver,
+                    success=result.success,
+                    tokens_used=result.tokens_used,
+                    duration_s=result.time_elapsed,
+                )
             )
         except Exception as exc:
             logger.debug("metrics.record_task failed: %s", exc)
@@ -907,12 +933,23 @@ class ResolutionPipeline:
         if self.checkpoint is None:
             return
         try:
+            # Persist a JSON-serializable metrics snapshot, never the collector
+            # object itself (N-7: it used to land as "<MetricsCollector object
+            # at 0x...>" via json default=str).
+            metrics_snap: dict = {}
+            if self.metrics is not None and hasattr(self.metrics, "snapshot"):
+                try:
+                    metrics_snap = (
+                        await maybe_await(self.metrics.snapshot()) or {}
+                    )
+                except Exception:
+                    metrics_snap = {}
             await maybe_await(
                 self.checkpoint.save(
                     self._tasks,
                     list(self._results.values()),
                     phase,
-                    self.metrics,
+                    metrics_snap,
                 )
             )
             logger.debug("checkpoint saved (phase=%s, %d results)", phase, len(self._results))
@@ -945,6 +982,14 @@ class ResolutionPipeline:
             try:
                 snap = await maybe_await(self.metrics.snapshot()) or {}
                 counts_provider = dict(snap.get("by_provider") or {})
+                if not counts_provider and isinstance(snap.get("llm"), dict):
+                    # Derive from the per-provider llm series (both sides of
+                    # the metrics boundary stay aligned, N-2c).
+                    counts_provider = {
+                        str(p): int(e.get("calls", 0))
+                        for p, e in snap["llm"].items()
+                        if isinstance(e, dict)
+                    }
             except Exception:
                 counts_provider = {}
         report = RunReport(

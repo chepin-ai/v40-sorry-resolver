@@ -4,3 +4,6 @@ dist/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# bundle unpack fallback (tools/make_kaggle_bundle.py smoke runs)
+v40_src/

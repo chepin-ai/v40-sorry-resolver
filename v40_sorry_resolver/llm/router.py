@@ -60,15 +60,24 @@ class MultiLLMRouter:
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_config(cls, cfg: V40Config, cache=None) -> "MultiLLMRouter":
-        """Build clients for all enabled providers in the config."""
+    def from_config(cls, cfg: V40Config, cache=None, metrics=None) -> "MultiLLMRouter":
+        """Build clients for all enabled providers in the config.
+
+        ``metrics`` is the collector shared with the pipeline (N-2); when
+        None each client falls back to the process-wide global collector.
+        DeepSeek providers get the configured reasoner model wired for
+        thinking=True calls (SPEC 3.3 reasoning-model routing, N-8).
+        """
         clients = {}
         for name, provider_cfg in cfg.providers.items():
             if not provider_cfg.enabled:
                 continue
-            client = AsyncLLMClient(provider_cfg, cache=cache)
+            client = AsyncLLMClient(provider_cfg, cache=cache, metrics=metrics)
             client.default_temperature = cfg.llm_temperature
             client.thinking_max_tokens = cfg.thinking_max_tokens
+            if name.startswith("deepseek"):
+                reasoner = getattr(cfg, "deepseek_reasoner_model", "") or ""
+                client.reasoner_model = reasoner.strip() or None
             clients[name] = client
         return cls(clients, cfg.providers)
 
