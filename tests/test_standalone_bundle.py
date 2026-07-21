@@ -274,6 +274,22 @@ def test_self_test_eval_fail_hard(bundle):
     assert not ok and any("Hard" in r for r in reasons)
 
 
+def test_self_test_eval_with_scanned_hard_ids(bundle):
+    report = {
+        "solved": 8,
+        "verify_pass_rate": 1.0,
+        "results": [
+            {"task_id": "aaa", "success": False},
+            {"task_id": "bbb", "success": False},
+            {"task_id": "ccc", "success": True},
+        ],
+    }
+    ok, reasons = bundle.evaluate_self_test(report, hard_ids={"aaa", "bbb"})
+    assert ok and reasons == []
+    ok, reasons = bundle.evaluate_self_test(report, hard_ids={"aaa", "ccc"})
+    assert not ok and any("Hard" in r for r in reasons)
+
+
 # ------------------------------------------------------------- lean install
 
 

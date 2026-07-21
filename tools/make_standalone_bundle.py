@@ -638,7 +638,38 @@ SELF_TEST_TOTAL = 11
 SELF_TEST_HARD_REJECTS = 2
 
 
-def evaluate_self_test(report):
+def _scan_hard_task_ids(project):
+    """Scan the mini project and return task ids living in Hard.lean.
+
+    Returns None when scanning is unavailable (caller falls back to a
+    heuristic on task ids)."""
+    try:
+        import asyncio
+
+        from v40_sorry_resolver.sorrydb import SorryScanner
+
+        try:
+            scanner = SorryScanner([project])
+        except TypeError:
+            scanner = SorryScanner()
+
+        async def _go():
+            res = scanner.scan([project])
+            if asyncio.iscoroutine(res) or hasattr(res, "__await__"):
+                res = await res
+            return res
+
+        tasks = asyncio.run(_go()) or []
+        return {
+            str(getattr(t, "id", ""))
+            for t in tasks
+            if "Hard" in str(getattr(t, "file_path", ""))
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def evaluate_self_test(report, hard_ids=None):
     """Check a run-report dict against the printed baseline.
 
     Returns (ok, reasons:list[str])."""
@@ -646,7 +677,10 @@ def evaluate_self_test(report):
     solved = int(report.get("solved", 0))
     vpr = float(report.get("verify_pass_rate", 0.0))
     results = report.get("results", []) or []
-    hard = [r for r in results if "Hard" in str(r.get("task_id", ""))]
+    if hard_ids is not None:
+        hard = [r for r in results if str(r.get("task_id", "")) in hard_ids]
+    else:  # heuristic fallback: task ids that embed the file name
+        hard = [r for r in results if "Hard" in str(r.get("task_id", ""))]
     hard_rejected = sum(1 for r in hard if not r.get("success"))
     if solved < SELF_TEST_MIN_SOLVED:
         reasons.append(f"solved {solved} < {SELF_TEST_MIN_SOLVED}")
@@ -701,15 +735,24 @@ def run_self_test(argv, work_root):
             break
         except Exception:  # noqa: BLE001
             continue
-    ok, reasons = evaluate_self_test(report)
+    hard_ids = _scan_hard_task_ids(project)
+    ok, reasons = evaluate_self_test(report, hard_ids=hard_ids)
     solved = int(report.get("solved", 0))
     vpr = float(report.get("verify_pass_rate", 0.0))
+    results = report.get("results") or []
+    if hard_ids is not None:
+        hard_rej = sum(
+            1 for r in results if str(r.get("task_id", "")) in hard_ids and not r.get("success")
+        )
+    else:
+        hard_rej = sum(
+            1 for r in results if "Hard" in str(r.get("task_id", "")) and not r.get("success")
+        )
     print("=== v40 self-test baseline comparison ===")
     print(f"solved: {solved}/{SELF_TEST_TOTAL} (baseline >= {SELF_TEST_MIN_SOLVED})")
     print(f"verify_pass_rate: {vpr:.2f} (baseline 1.00)")
     print(
-        f"Hard rejections: "
-        f"{sum(1 for r in (report.get('results') or []) if 'Hard' in str(r.get('task_id','')) and not r.get('success'))}"
+        f"Hard rejections: {hard_rej}"
         f" (baseline {SELF_TEST_HARD_REJECTS}; unprovable sorries must be rejected)"
     )
     if rc != 0:
