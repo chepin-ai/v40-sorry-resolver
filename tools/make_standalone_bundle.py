@@ -197,6 +197,31 @@ def _pip_install(packages, index_url=TUNA_INDEX, timeout=600):
     return False
 
 
+def _refresh_site_paths():
+    """Make packages pip-installed *during this process* importable.
+
+    pip may target the user site (unwritable system site, or a $HOME that
+    changed after interpreter start); that directory is only added to
+    sys.path at startup when it already exists, so re-add it explicitly.
+    """
+    import importlib
+    import site
+
+    importlib.invalidate_caches()
+    candidates = []
+    try:
+        candidates += list(site.getsitepackages())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        candidates.append(site.getusersitepackages())
+    except Exception:  # noqa: BLE001
+        pass
+    for cand in candidates:
+        if cand and os.path.isdir(cand) and cand not in sys.path:
+            sys.path.append(cand)
+
+
 def _ensure_module(module, packages):
     try:
         __import__(module)
@@ -204,8 +229,10 @@ def _ensure_module(module, packages):
     except ImportError:
         pass
     _log(f"installing missing python deps: {', '.join(packages)}")
-    if not _pip_install(packages):
-        return False
+    # Even a non-zero pip exit can leave a partial install on disk (one
+    # package of several succeeded); refresh and try the import regardless.
+    _pip_install(packages)
+    _refresh_site_paths()
     try:
         __import__(module)
         return True
@@ -220,52 +247,70 @@ class _StalledDownload(Exception):
     """Raised when a mirror connects but transfers too slowly."""
 
 
-def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20):
+def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20,
+              max_attempts=3):
     """Try each URL in order (direct first, ghfast proxy fallback).
 
-    A mirror that connects but sustains < ``min_rate_kbps`` KiB/s after a
-    ``stall_window`` seconds grace period counts as failed, so a crawling
-    direct link quickly falls through to the proxy mirror.
+    - A mirror that connects but sustains < ``min_rate_kbps`` KiB/s after a
+      ``stall_window`` seconds grace period counts as failed, so a crawling
+      direct link quickly falls through to the proxy mirror.
+    - Truncated transfers (Content-Length mismatch) are retried with an HTTP
+      Range resume, up to ``max_attempts`` per mirror.
     """
     import time
 
     last = None
     for url in urls:
-        try:
-            _log(f"downloading {url}")
-            req = urllib.request.Request(url, headers={"User-Agent": "v40-standalone"})
-            start = time.monotonic()
-            got = 0
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(
-                dest, "wb"
-            ) as fh:
-                try:
-                    expected = int(resp.headers.get("Content-Length") or 0)
-                except (TypeError, ValueError):
-                    expected = 0
-                while True:
-                    chunk = resp.read(1 << 16)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    got += len(chunk)
-                    elapsed = time.monotonic() - start
-                    if elapsed > stall_window:
-                        rate = got / 1024.0 / elapsed
-                        if rate < min_rate_kbps:
-                            raise _StalledDownload(
-                                f"{rate:.1f} KiB/s < {min_rate_kbps} KiB/s"
-                            )
-            if expected and got != expected:
-                raise _StalledDownload(
-                    f"truncated download: {got} of {expected} bytes"
-                )
-            if got > 0 and os.path.getsize(dest) > 0:
-                _log(f"downloaded {got / 1e6:.1f} MB in {time.monotonic() - start:.0f}s")
-                return url
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            _warn(f"download failed ({url}): {exc}")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resume_from = os.path.getsize(dest) if os.path.isfile(dest) else 0
+                headers = {"User-Agent": "v40-standalone"}
+                if resume_from:
+                    headers["Range"] = f"bytes={resume_from}-"
+                suffix = ""
+                if resume_from or attempt > 1:
+                    suffix = f" (attempt {attempt}, resume @{resume_from})"
+                _log(f"downloading {url}{suffix}")
+                req = urllib.request.Request(url, headers=headers)
+                start = time.monotonic()
+                got = 0
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = getattr(resp, "status", 200) or 200
+                    if resume_from and status != 206:
+                        resume_from = 0  # server ignored Range; start over
+                    try:
+                        length = int(resp.headers.get("Content-Length") or 0)
+                    except (TypeError, ValueError):
+                        length = 0
+                    expected = (resume_from + length) if length else 0
+                    with open(dest, "ab" if resume_from else "wb") as fh:
+                        while True:
+                            chunk = resp.read(1 << 16)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            got += len(chunk)
+                            elapsed = time.monotonic() - start
+                            if elapsed > stall_window:
+                                rate = got / 1024.0 / elapsed
+                                if rate < min_rate_kbps:
+                                    raise _StalledDownload(
+                                        f"{rate:.1f} KiB/s < {min_rate_kbps} KiB/s"
+                                    )
+                final = resume_from + got
+                if expected and final != expected:
+                    raise _StalledDownload(
+                        f"truncated download: {final} of {expected} bytes"
+                    )
+                if final > 0 and os.path.getsize(dest) == final:
+                    _log(
+                        f"downloaded {final / 1e6:.1f} MB in "
+                        f"{time.monotonic() - start:.0f}s"
+                    )
+                    return url
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                _warn(f"download failed ({url}): {exc}")
     raise RuntimeError(f"all download mirrors failed; last error: {last}")
 
 
