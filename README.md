@@ -3,6 +3,30 @@
 面向 Lean 4 项目的异步 `sorry` 消解引擎：多 LLM 角色编排 + worker-pool 真并发 +
 真实子进程验证链 + 原子 checkpoint 断点续跑。设计契约见 `SPEC.md`。
 
+## 一键运行（自包含单文件）
+
+仓库根目录的 [`v40_standalone.py`](v40_standalone.py) 是**自包含、自安装**的单文件：
+内嵌完整 `v40_sorry_resolver` 包 + 自测用 Lean mini 项目，首次运行自动安装
+elan + Lean 4.20.0 与 pip 依赖（直连失败自动走 ghfast 代理），随后进入正常 CLI。
+
+```bash
+# 下载（raw URL）
+curl -L -o v40_standalone.py \
+  https://raw.githubusercontent.com/chepin-ai/v40-sorry-resolver/master/v40_standalone.py
+
+# 零成本端到端自测（mock LLM + 真实 subprocess 验证器；应 ≥7/11 solved、vpr=1.0）
+python v40_standalone.py --self-test
+
+# 跑真实项目（本地路径或 github: 任务源，支持 owner/repo[/subdir][@ref]）
+python v40_standalone.py --project /path/to/lean/project
+python v40_standalone.py --project github:chepin-ai/v40-sorry-resolver/examples/lean_mini_project
+
+# Kaggle 单元格（密钥走 Kaggle Secrets：DEEPSEEK_API_KEY / KIMI_API_KEY / LONGCAT_API_KEY）
+%run v40_standalone.py --project github:owner/repo --workers 16 --wall-clock-budget 36000
+```
+
+环境自举可用 `--skip-bootstrap` 关闭；`--real-llm` 让自测使用真实 API key。
+
 ## 架构图
 
 ```
