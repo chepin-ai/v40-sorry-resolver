@@ -2626,7 +2626,7 @@ def main(argv=None):
     if _argv_has_flag(argv, "--self-test"):
         return run_self_test(argv, work_root)
 
-    if not have_keys and not _argv_has_flag(argv, "--mock-llm"):
+    if not have_keys and not _argv_has_flag(argv, "--mock-llm", "--dry-run"):
         _warn("refusing to run without API keys (use --mock-llm for a dry exercise)")
         return 2
 
