@@ -64,6 +64,52 @@ mathlib CI state).
   stall semantics (the new defaults intentionally extend the loop with
   replanning).
 
+## [Unreleased] — verification infrastructure (2026-07)
+
+Verification-layer roadmap items 1-2 from `LOCAL_GUIDE.md` §7 (Kimina Lean
+Server resident-REPL pattern + LeanInteract backend). Regression-safe: the
+default verifier remains `subprocess`; new backends are opt-in via
+`V40_VERIFIER`.
+
+### Added
+
+- **Resident REPL pool** (`verify/repl_pool.py`): `ReplPool(project_path,
+  size)` with asyncio-condition `acquire(task)`/`release(session)`; affinity
+  binding keyed by `(project, file, theorem)` so consecutive candidates of
+  one theorem reuse the same REPL (import head stays elaborated — saves the
+  per-candidate spawn+elaborate overhead). **Memory guard**: a background
+  sweep reads `/proc/<pid>/status` VmRSS over each session's process tree and
+  poisons sessions above `repl_max_rss_mb` (default 1500) — idle sessions are
+  evicted and rebuilt warm, checked-out ones dropped on release. This is the
+  workaround for the "REPL has no memory limit" known limitation (Lean 4.20
+  ignores `-Dweak.max_memory`). `close()` is idempotent and kills whole
+  process trees plus an `/proc/*/environ` orphan sweep (the
+  `kill_descendants` reparent race), so no REPL processes leak.
+- **Hybrid dual-channel verifier** (`verify/hybrid.py`,
+  `V40_VERIFIER=hybrid`): tactic-level probing (goal states, stepwise
+  `run_tactic`) goes through the REPL pool; final judgement stays with
+  `SubprocessLeanVerifier` whole-file compilation. The REPL verdict is
+  computed concurrently as a witness — agreement counters detect REPL
+  protocol drift; the subprocess verdict is always authoritative.
+- **LeanInteract third backend** (`verify/lean_interact.py`,
+  `V40_VERIFIER=lean_interact`): SPEC 3.6 Verifier on the
+  LeanInteract/repl stack (SorryDB's official verifier base,
+  `pip install lean-interact`). Reuses the SPEC 3.7 splice machinery; one
+  REPL `Command` per candidate in a fresh env (no redeclaration), incremental
+  elaboration caches the shared prefix. Missing package / init failure raises
+  `LeanInteractUnavailableError` with install instructions — never silent
+  fallback. `V40_LEAN_INTERACT_REPL_GIT` overrides the REPL git URL for
+  GitHub-restricted networks.
+- **Config**: `repl`/`hybrid`/`lean_interact` added to `VALID_VERIFIERS` and
+  the `build_verifier` factory; new `V40Config.repl_pool_size` (default 2)
+  and `V40Config.repl_max_rss_mb` (default 1500), env-overridable via
+  `V40_REPL_POOL_SIZE` / `V40_REPL_MAX_RSS_MB`.
+- **Tests**: `tests/test_repl_pool.py` (8, real dojo: concurrent-acquire
+  mutual exclusion, affinity reuse counting, memory-guard trigger via fake
+  RSS data, leak cleanup), `tests/test_lean_interact.py` (8: missing-package
+  error text + real protocol conformance), `tests/test_hybrid.py` (6, real
+  mini project end-to-end).
+
 ## [Unreleased] — frontier integration (2026-07)
 
 Integrates the **verified actionable items** from the 2026-07 frontier research
