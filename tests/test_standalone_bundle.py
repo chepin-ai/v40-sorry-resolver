@@ -306,6 +306,21 @@ def test_prepend_path_idempotent(bundle, monkeypatch):
     assert os.environ["PATH"].startswith("/opt/x")
 
 
+def test_ensure_lean_reuses_warm_toolchain_dir(bundle, monkeypatch, tmp_path):
+    monkeypatch.setattr(bundle, "_lake_on_path", lambda: None)
+    fakebin = tmp_path / ".v40" / "toolchains" / "lean" / "bin"
+    fakebin.mkdir(parents=True)
+    (fakebin / "lake").write_text("#!fake\n")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(bundle.os.path, "expanduser", lambda p: str(tmp_path))
+    monkeypatch.setattr(bundle, "_elan_home", lambda: str(tmp_path / "no-elan"))
+    monkeypatch.setattr(
+        bundle, "_try_elan_install", lambda: pytest.fail("must not reinstall")
+    )
+    assert bundle.ensure_lean() is True
+    assert str(fakebin) in os.environ["PATH"].split(os.pathsep)
+
+
 def test_ensure_lean_skips_when_lake_present(bundle, monkeypatch):
     monkeypatch.setattr(bundle, "_lake_on_path", lambda: "/usr/bin/lake")
     monkeypatch.setattr(

@@ -2298,10 +2298,21 @@ def _install_lean_manually():
 
 
 def ensure_lean():
-    """Idempotent: no-op (fast) when lake is already on PATH."""
+    """Idempotent: no-op (fast) when lake is already available."""
     if _lake_on_path():
         _log(f"lake found: {_lake_on_path()} (skip install)")
         return True
+    # Warm filesystem but cold PATH (e.g. new shell / Kaggle session):
+    # re-expose previously installed toolchains instead of reinstalling.
+    candidates = [
+        os.path.join(_elan_home(), "bin"),
+        os.path.join(os.path.expanduser("~"), ".v40", "toolchains", "lean", "bin"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(os.path.join(cand, "lake")):
+            _prepend_path(cand)
+            _log(f"lake found: {_lake_on_path()} (skip install)")
+            return True
     _log(f"lake not found; installing Lean {LEAN_VERSION} toolchain...")
     if _try_elan_install():
         _log("elan + Lean installed")
