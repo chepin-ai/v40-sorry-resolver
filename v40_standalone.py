@@ -2129,8 +2129,8 @@ class _StalledDownload(Exception):
     """Raised when a mirror connects but transfers too slowly."""
 
 
-def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20,
-              max_attempts=3):
+def _download(urls, dest, timeout=300, min_rate_kbps=8, stall_window=30,
+              max_attempts=6):
     """Try each URL in order (direct first, ghfast proxy fallback).
 
     - A mirror that connects but sustains < ``min_rate_kbps`` KiB/s after a
@@ -2323,9 +2323,17 @@ def _install_lean_manually():
         f"https://github.com/leanprover/lean4/releases/download/"
         f"v{LEAN_VERSION}/{asset}"
     )
-    tmpdir = tempfile.mkdtemp(prefix="v40-lean-")
-    archive = os.path.join(tmpdir, asset)
+    # Stable cache location: a killed/re-run bootstrap resumes the partial
+    # download (Range) instead of starting from zero.
+    cache_dir = os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"),
+        "v40",
+        "downloads",
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    archive = os.path.join(cache_dir, asset)
     _download(_with_ghfast(base), archive, timeout=1800)
+    tmpdir = tempfile.mkdtemp(prefix="v40-lean-")
     extract_root = os.path.join(tmpdir, "x")
     if asset.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
