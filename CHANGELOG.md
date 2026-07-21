@@ -2,6 +2,42 @@
 
 All notable changes to the v40 sorry resolver are documented here.
 
+## [Unreleased] — standalone bundle R2 hardening (2026-07-21, g-docs)
+
+Documentation for fixes shipped in `f71814a` + `3975a82` (master), verified
+end-to-end from the raw GitHub URL in a bare sandbox (fresh `$HOME`, no
+elan/Lean/pip deps):
+
+### Fixed
+
+- **R2 download resilience** (`v40_standalone.py` `_download`): TCP-connect and
+  every blocking read are now capped by `connect_timeout=30s`, so a half-dead
+  mirror that hangs the handshake is abandoned within ~30s instead of blocking
+  the full per-attempt timeout (v39 12h-hang class). Verified live: direct
+  GitHub mirror produced `urlopen error timed out` / `2.0 KiB/s < 8 KiB/s`
+  stall aborts in ~30-35s per attempt before the run fell through and
+  completed via Range resume.
+- **Dependency-free `--help`** (`v40_standalone.py`): CLI help text is embedded
+  at bundle build time, so `--help` works in a bare environment before any
+  bootstrap (previously importing the package pulled third-party deps and the
+  help path itself could fail on a naked Kaggle kernel). Verified: exit 0 on a
+  fresh `$HOME` with no pip packages.
+- **CLI `--verifier` choices synced with `VALID_VERIFIERS`**: help/argparse
+  choices are now generated from the single source of truth
+  `("subprocess", "dojo", "repl", "hybrid", "lean_interact", "mock")` instead
+  of a drifted hardcoded list. Verified: `--help` output matches
+  `config.VALID_VERIFIERS` exactly.
+
+### Known issues (verified 2026-07-21)
+
+- **Complete-cache 416 edge** (`_download`): if a previous run was killed
+  *after* the Lean tarball finished downloading but *before* the toolchain
+  install completed, the next run sends `Range: bytes=<full-size>-`, every
+  mirror answers `HTTP 416`, and bootstrap aborts with "all download mirrors
+  failed". Workaround: delete `~/.cache/v40/downloads/lean-*-linux.tar.zst`
+  (or the whole `~/.cache/v40` dir) and re-run. Partial caches resume
+  correctly via `206 Partial Content`; only the 100%-complete cache trips.
+
 ## [Unreleased] — agentic roadmap (2026-07-21, feat-roadmap-agentic)
 
 Roadmap items from `LOCAL_GUIDE.md` §7 + `frontier_atp.md` Top-8 #2/#4/#5,
