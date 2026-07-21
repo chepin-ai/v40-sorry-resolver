@@ -56,10 +56,15 @@ def build_verifier(cfg: V40Config) -> Verifier:
 
     - ``subprocess`` (default): ``SubprocessLeanVerifier``.
     - ``dojo``: ``LeanDojoVerifier`` (flag-gated, optional).
+    - ``repl``: ``ReplPoolVerifier`` (resident REPL pool, tactic-level).
+    - ``hybrid``: ``HybridVerifier`` (REPL pool probing + subprocess final
+      judgement, dual-channel cross-check).
+    - ``lean_interact``: ``LeanInteractVerifier`` (LeanInteract/REPL stack).
     - ``mock``: ``MockVerifier`` (tests only; must be explicitly requested).
 
     Imports are lazy so importing this module never pulls in heavy optional
-    dependencies (lean_dojo) unless that path is actually selected.
+    dependencies (lean_dojo, lean_interact) unless that path is actually
+    selected.
     """
     name = (getattr(cfg, "verifier", "subprocess") or "subprocess").strip().lower()
     if name == "subprocess":
@@ -70,10 +75,23 @@ def build_verifier(cfg: V40Config) -> Verifier:
         from .dojo import LeanDojoVerifier
 
         return LeanDojoVerifier(cfg)
+    if name == "repl":
+        from .repl_pool import ReplPoolVerifier
+
+        return ReplPoolVerifier(cfg)
+    if name == "hybrid":
+        from .hybrid import HybridVerifier
+
+        return HybridVerifier(cfg)
+    if name == "lean_interact":
+        from .lean_interact import LeanInteractVerifier
+
+        return LeanInteractVerifier(cfg)
     if name == "mock":
         from .mock import MockVerifier
 
         return MockVerifier(cfg)
     raise ValueError(
-        f"unknown verifier {name!r}; expected one of: subprocess|dojo|mock"
+        f"unknown verifier {name!r}; expected one of: "
+        f"subprocess|dojo|repl|hybrid|lean_interact|mock"
     )

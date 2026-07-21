@@ -18,7 +18,7 @@ __all__ = ["LLMProviderConfig", "V40Config", "BudgetTier"]
 
 logger = logging.getLogger(__name__)
 
-VALID_VERIFIERS = ("subprocess", "dojo", "mock")
+VALID_VERIFIERS = ("subprocess", "dojo", "repl", "hybrid", "lean_interact", "mock")
 
 # Public, real default model/base-URL values (SPEC 3.2 env contract).
 #
@@ -83,9 +83,17 @@ class V40Config:
     )
     sorrydb_endpoint: Optional[str] = None  # None = do not fetch remotely
     # Verification
-    verifier: str = "subprocess"  # subprocess|dojo|mock (mock only for tests)
+    verifier: str = "subprocess"  # subprocess|dojo|repl|hybrid|lean_interact|mock (mock only for tests)
     lean_timeout_s: float = 30.0
     max_concurrent_lean: int = 4
+    # Resident REPL pool (verifier=repl|hybrid; LOCAL_GUIDE section 7 item 1):
+    # sessions are reused across candidates of the same theorem (import head
+    # stays elaborated in the REPL environment).
+    repl_pool_size: int = 2
+    # Per-session process-tree VmRSS ceiling in MB. Lean 4.20 ignores
+    # -Dweak.max_memory (env_report known limitation), so the pool enforces
+    # this itself by reading /proc and rebuilding fat sessions.
+    repl_max_rss_mb: int = 1500
     check_axioms: bool = False  # append `#print axioms`, reject sorryAx
     # SorryDB anti-cheat protocol (frontier_atp 5.1 / Top-8 #7): when True the
     # verifier additionally asserts (1) the target theorem's sorry count drops
@@ -188,6 +196,12 @@ class V40Config:
         verifier = get("V40_VERIFIER", "subprocess").strip() or "subprocess"
         cfg.verifier = verifier
         cfg.num_workers = _as_int(get("V40_NUM_WORKERS", ""), cfg.num_workers)
+        cfg.repl_pool_size = _as_int(
+            get("V40_REPL_POOL_SIZE", ""), cfg.repl_pool_size
+        )
+        cfg.repl_max_rss_mb = _as_int(
+            get("V40_REPL_MAX_RSS_MB", ""), cfg.repl_max_rss_mb
+        )
         return cfg
 
     # ------------------------------------------------------------------
@@ -212,6 +226,15 @@ class V40Config:
             )
         if self.lean_timeout_s <= 0:
             problems.append(f"lean_timeout_s must be > 0, got {self.lean_timeout_s}")
+        if self.repl_pool_size < 1:
+            problems.append(
+                f"repl_pool_size must be >= 1, got {self.repl_pool_size}"
+            )
+        if self.repl_max_rss_mb < 100:
+            problems.append(
+                f"repl_max_rss_mb must be >= 100 (one REPL needs ~800 MB), "
+                f"got {self.repl_max_rss_mb}"
+            )
         if self.wall_clock_budget_s <= 0:
             problems.append(
                 f"wall_clock_budget_s must be > 0, got {self.wall_clock_budget_s}"

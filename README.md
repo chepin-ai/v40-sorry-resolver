@@ -76,7 +76,9 @@ chat 401 的假阳性），全部失败且未用 `--mock-llm` 时直接报错退
 | `DEEPSEEK_REASONER_MODEL` | thinking 调用的推理模型 | `deepseek-v4-pro` |
 | `KIMI_API_KEY` / `KIMI_BASE_URL` / `KIMI_MODEL` | CRITIC | `https://api.moonshot.cn/v1` / `moonshot-v1-8k` |
 | `LONGCAT_API_KEY` / `LONGCAT_BASE_URL` / `LONGCAT_MODEL` | EXPLORER | `https://api.longcat.chat/openai/v1` / `LongCat-2.0` |
-| `V40_VERIFIER` | 验证后端 `subprocess`/`dojo`/`mock` | `subprocess` |
+| `V40_VERIFIER` | 验证后端 `subprocess`/`dojo`/`repl`/`hybrid`/`lean_interact`/`mock` | `subprocess` |
+| `V40_REPL_POOL_SIZE` | 常驻 REPL 池大小（`repl`/`hybrid`） | `2` |
+| `V40_REPL_MAX_RSS_MB` | 单会话进程树 VmRSS 上限（MB），超限重建 | `1500` |
 | `V40_NUM_WORKERS` | worker 协程数 | `8` |
 
 真实环境变量优先于 `.env` 文件；`.env` 已 gitignore，源码零硬编码密钥。
@@ -134,6 +136,9 @@ v40_kaggle_bundle.main([
 | `subprocess`（默认） | 生产 | 每次候选在独立临时目录拼接后跑 `lake env lean` 真实编译；词边界黑名单（剥注释后匹配 `sorry`/`admit`/`stop`）先行；超时杀整个进程组；不支持 symlink 的文件系统自动回退 copy |
 | `dojo` | 实验（flag-gated） | LeanDojo 通路 v1；上游阻塞时 `init()` 显式抛 `DojoUnavailableError`，绝不静默降级 |
 | `dojo_v2` | 交互式 tactic 级（可用） | `LeanDojoV2Verifier`（`verify/dojo_v2.py`）：LeanDojo 交互 `run_tac` 通路，真实状态级验证（初始 goal → 逐步 tactic → 内核复核的 ProofFinished）。需先跑 `python3 /mnt/agents/output/patch_lean_dojo.py`（双向 FIFO + 内核前缀修复，幂等）并 trace 一次目标仓库（`python3 /mnt/agents/output/trace_noapi.py`）。除 SPEC `Verifier` 协议外另暴露 `open_task(task)`/`run_tactic(task, state_id, tactic)` 供搜索/agent 逐步验证；e2e 证据 `python3 /mnt/agents/output/dojo_e2e_proof.py`，根因链见 `/mnt/agents/output/dojo_breakthrough.md` |
+| `repl` | 常驻 REPL 池（tactic 级） | `ReplPoolVerifier`（`verify/repl_pool.py`）：`ReplPool` 按 (project, file, theorem) 亲和复用 lean-dojo 会话（import 头常驻，省每候选 spawn+elaborate）；内存守卫周期读 `/proc` VmRSS，超 `repl_max_rss_mb` 排出并重建（4.20 下 `-Dweak.max_memory` 失效的破解手段）；`close()` 杀全部子进程树+environ 孤儿扫描防泄漏。需同 dojo_v2 的 patch+trace 前置 |
+| `hybrid` | 双通道互证（推荐 tactic 搜索） | `HybridVerifier`（`verify/hybrid.py`）：tactic 级探查（goal 状态/逐步 `run_tactic`）走 REPL 池，终判 `verify_proof` 走 subprocess 整文件编译（防 REPL 协议漂移）；REPL 判定并发计算作 witness，一致/分歧计数暴露漂移，subprocess 判定恒为准 |
+| `lean_interact` | 第三后端（SorryDB 官方栈） | `LeanInteractVerifier`（`verify/lean_interact.py`）：LeanInteract/repl 通路（`pip install lean-interact`，frontier_resources §3b）；复用 SPEC 3.7 拼接机制，每候选一条 REPL `Command`（fresh env 无重声明冲突，增量 elaboration 缓存共享前缀）；包缺失/初始化失败抛 `LeanInteractUnavailableError`（含安装指引），禁止静默降级；`V40_LEAN_INTERACT_REPL_GIT` 可覆盖 REPL git 源（GitHub 受限网络） |
 | `mock` | **仅测试** | 只认 `VALID` 标记；经此通路的结果全部 `unverified=True`，报告与 run json 标注 `[UNVERIFIED]` |
 
 任何相位的“成功”都必须再过一次统一 `verifier.verify_proof` 复核才入账——没有
