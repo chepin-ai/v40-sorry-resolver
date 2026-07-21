@@ -2098,18 +2098,44 @@ def _ensure_module(module, packages):
 # -------------------------------------------------------------- download util
 
 
-def _download(urls, dest, timeout=300):
-    """Try each URL in order (direct first, ghfast proxy fallback)."""
+class _StalledDownload(Exception):
+    """Raised when a mirror connects but transfers too slowly."""
+
+
+def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20):
+    """Try each URL in order (direct first, ghfast proxy fallback).
+
+    A mirror that connects but sustains < ``min_rate_kbps`` KiB/s after a
+    ``stall_window`` seconds grace period counts as failed, so a crawling
+    direct link quickly falls through to the proxy mirror.
+    """
+    import time
+
     last = None
     for url in urls:
         try:
             _log(f"downloading {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "v40-standalone"})
+            start = time.monotonic()
+            got = 0
             with urllib.request.urlopen(req, timeout=timeout) as resp, open(
                 dest, "wb"
             ) as fh:
-                shutil.copyfileobj(resp, fh)
-            if os.path.getsize(dest) > 0:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    got += len(chunk)
+                    elapsed = time.monotonic() - start
+                    if elapsed > stall_window:
+                        rate = got / 1024.0 / elapsed
+                        if rate < min_rate_kbps:
+                            raise _StalledDownload(
+                                f"{rate:.1f} KiB/s < {min_rate_kbps} KiB/s"
+                            )
+            if got > 0 and os.path.getsize(dest) > 0:
+                _log(f"downloaded {got / 1e6:.1f} MB in {time.monotonic() - start:.0f}s")
                 return url
         except Exception as exc:  # noqa: BLE001
             last = exc
@@ -2167,10 +2193,14 @@ def _try_elan_install():
     script = os.path.join(tmpdir, "elan-init.sh")
     try:
         _download(list(ELAN_INIT_URLS), script, timeout=120)
-        proc = subprocess.run(
-            ["sh", script, "-y", "--default-toolchain", LEAN_TOOLCHAIN],
-            timeout=1800,
-        )
+        try:
+            proc = subprocess.run(
+                ["sh", script, "-y", "--default-toolchain", LEAN_TOOLCHAIN],
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            _warn("elan installer stalled (>300s); treating as failed")
+            return False
         _prepend_path(os.path.join(_elan_home(), "bin"))
         return proc.returncode == 0 and _lake_on_path() is not None
     except Exception as exc:  # noqa: BLE001
