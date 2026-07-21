@@ -19,7 +19,7 @@ from v40_sorry_resolver.verify.base import build_verifier
 from v40_sorry_resolver.cache import Cache
 from v40_sorry_resolver.checkpoint import Checkpoint
 from v40_sorry_resolver.metrics import MetricsCollector
-from v40_sorry_resolver.sorrydb import SorryScanner
+from v40_sorry_resolver.sorrydb import SorryScanner, SorryDBClient
 from v40_sorry_resolver.progress import LeanProgressV2
 from v40_sorry_resolver.engine import maybe_await
 from v40_sorry_resolver.engine.orchestrator import ResolutionPipeline, StrategyConfig
@@ -34,12 +34,24 @@ def build_parser() -> argparse.ArgumentParser:
         prog="v40_sorry_resolver",
         description="v40 async Lean 4 sorry resolution engine",
     )
-    p.add_argument(
+    source = p.add_mutually_exclusive_group()
+    source.add_argument(
         "--project-paths",
+        "--project",
+        dest="project_paths",
         action="append",
         default=None,
         metavar="PATH",
-        help="Lean project root(s); repeatable. Overrides config lean_project_paths.",
+        help="Lean project root(s); repeatable (`--project` is an alias). "
+        "Overrides config lean_project_paths.",
+    )
+    source.add_argument(
+        "--sorrydb",
+        default=None,
+        metavar="PATH_OR_URL",
+        help="SorryDB snapshot (local JSON/JSONL file or http(s) URL) as the "
+        "task source instead of scanning local project paths. Mutually "
+        "exclusive with --project-paths.",
     )
     p.add_argument("--workers", type=int, default=None, help="parallel worker count")
     p.add_argument(
@@ -220,13 +232,37 @@ async def async_main(args: argparse.Namespace) -> int:
         )
         router = MultiLLMRouter.from_config(cfg, cache_for_router, metrics=metrics)
 
-    # Task source.
-    scanner = _construct(SorryScanner, (cfg,), (cfg.lean_project_paths,), ())
-    tasks = await maybe_await(scanner.scan(cfg.lean_project_paths))
-    if not tasks:
-        logger.warning("no sorry tasks found in %s", cfg.lean_project_paths)
+    # Task source: a SorryDB snapshot (--sorrydb) or a local-project scan.
+    scan_stats: dict = {}
+    if args.sorrydb:
+        cfg.sorrydb_endpoint = args.sorrydb
+        tasks = await SorryDBClient.load(args.sorrydb)
+        scan_stats = {"entries": len(tasks)}
+        if tasks:
+            logger.info("loaded %d sorry tasks from SorryDB %s", len(tasks), args.sorrydb)
     else:
-        logger.info("scanned %d sorry tasks", len(tasks))
+        scanner = _construct(SorryScanner, (cfg,), (cfg.lean_project_paths,), ())
+        tasks = await maybe_await(scanner.scan(cfg.lean_project_paths))
+        scan_stats = dict(getattr(scanner, "last_stats", {}) or {})
+        if tasks:
+            logger.info("scanned %d sorry tasks", len(tasks))
+
+    if not tasks:
+        # 0 sorries is a *legitimate* outcome (mathlib CI enforces zero
+        # sorries), so exit 0 with a friendly explanation + project stats —
+        # no health check, no verifier init, no scary warnings.
+        print(
+            "该项目未发现 sorry（若目标是 mathlib 等 CI 强制无 sorry 的库属正常）"
+        )
+        if args.sorrydb:
+            print(f"项目统计: SorryDB 条目数={scan_stats.get('entries', 0)}")
+        else:
+            print(
+                "项目统计: "
+                f"扫描文件数={scan_stats.get('files', 0)} "
+                f"定理/声明数={scan_stats.get('declarations', 0)}"
+            )
+        return 0
 
     if args.dry_run:
         health = await router.health_check_all()

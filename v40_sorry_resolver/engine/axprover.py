@@ -44,6 +44,7 @@ class AxProverV2:
         cfg=None,
         emergence=None,
         retriever=None,
+        lemma_cache=None,
     ):
         self.router = router
         self.verifier = verifier
@@ -53,6 +54,11 @@ class AxProverV2:
         self.emergence = emergence
         # Optional premise retriever (frontier_atp Top-8 #6); None = disabled.
         self.retriever = retriever
+        # Shared goal->proof cache (frontier_atp Top-8 #5); None = disabled.
+        self.lemma_cache = lemma_cache
+        # APOLLO sub-lemma decomposer (Top-8 #4); created lazily per solve so
+        # tests can inject a stub via self.decomposer.
+        self.decomposer = None
         # Introspection mirror of the LAST completed solve's notebook only;
         # the working notebook is a solve() local (per-task isolation, N-3).
         # Entries are (lesson, raw_diagnostics) pairs (frontier_atp Top-8 #2).
@@ -60,6 +66,21 @@ class AxProverV2:
 
     def _stall_patience(self) -> int:
         return int(getattr(self.cfg, "agentic_stall_patience", 3) or 3)
+
+    def _replan_max(self) -> int:
+        return max(0, int(getattr(self.cfg, "replan_max", 2) or 0))
+
+    def _apollo_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "apollo_enabled", True))
+
+    def _get_decomposer(self):
+        if self.decomposer is None:
+            from v40_sorry_resolver.engine.decompose import ApolloDecomposer
+
+            self.decomposer = ApolloDecomposer(
+                self.router, self.verifier, lemma_cache=self.lemma_cache, cfg=self.cfg
+            )
+        return self.decomposer
 
     async def solve(self, task: SorryTask, strategy) -> ResolutionResult:
         t0 = time.monotonic()
@@ -79,23 +100,107 @@ class AxProverV2:
         best_remaining: Optional[int] = None
         last_improve_iter = 0  # iteration 0 is the baseline
         last_error: Optional[str] = None
+        consec_fail = 0  # consecutive failed rounds (APOLLO trigger)
+        apollo_attempted = False
+        replans_used = 0
+        active_plan = ""  # CRITIC approach-switch plan (Top-8 #5 replanning)
+
+        # Shared lemma cache (frontier_atp Top-8 #5): a verified proof for
+        # this exact goal may already exist from another worker/phase.
+        cached = await self._cache_lookup(task)
+        if cached:
+            hit_result = await self._try_cached_proof(task, cached, t0)
+            if hit_result is not None:
+                self.notebook = list(notebook)
+                return hit_result
+
+        async def maybe_replan(iter_idx: int) -> bool:
+            """Stall handler: CRITIC approach-switch replan instead of an
+            immediate break (dynamic replanning, frontier_atp Top-8 #5).
+            Returns True when a replan was injected and the loop should
+            continue; False when the loop must break."""
+            nonlocal replans_used, last_improve_iter, active_plan
+            if replans_used >= self._replan_max():
+                return False
+            replans_used += 1
+            try:
+                plan = await self.critic.propose_alternative(
+                    task, notebook, last_error or ""
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                plan = f"APPROACH SWITCH: critic unavailable ({exc})"
+            active_plan = plan
+            self._push_lesson(notebook, f"replan: {plan}"[:_LESSON_CHARS], "")
+            last_improve_iter = iter_idx  # give the new approach a fresh budget
+            logger.info(
+                "axprover %s: stall -> approach-switch replan %d/%d",
+                task.id, replans_used, self._replan_max(),
+            )
+            return True
 
         for i in range(max_iter):
             iterations = i + 1
-            proof, toks, llm_error = await self._propose(task, prover, strategy, notebook)
+
+            # APOLLO sub-lemma decomposition (frontier_atp Top-8 #4): after
+            # >=2 consecutive failures, isolate-and-reprove sub-lemmas instead
+            # of resampling the whole proof.
+            if (
+                not apollo_attempted
+                and consec_fail >= 2
+                and self._apollo_enabled()
+            ):
+                apollo_attempted = True
+                apollo_proof = await self._apollo_attempt(task, strategy, notebook)
+                if apollo_proof:
+                    approved, note = await self.critic.review_proof(task, apollo_proof)
+                    if self.emergence is not None:
+                        self.emergence.cross_eval(task.id, agree=bool(approved))
+                    if approved:
+                        self.notebook = list(notebook)
+                        return ResolutionResult(
+                            task_id=task.id,
+                            success=True,
+                            status=ProofStatus.SOLVED_AGENTIC,
+                            proof=apollo_proof,
+                            solver="axprover_v2_apollo",
+                            iterations=iterations,
+                            tokens_used=tokens_used,
+                            time_elapsed=time.monotonic() - t0,
+                            remaining_goals=0,
+                            # grounded in the decomposer's final verify_proof
+                            verification_passed=True,
+                        )
+                    last_error = f"critic rejected apollo proof: {note}"
+                    self._push_lesson(
+                        notebook, f"critic: {note}"[:_LESSON_CHARS], ""
+                    )
+                else:
+                    self._push_lesson(
+                        notebook, "apollo: decomposition/reassembly failed", ""
+                    )
+
+            proof, toks, llm_error = await self._propose(
+                task, prover, strategy, notebook, plan=active_plan
+            )
             tokens_used += toks
             if llm_error is not None:
                 last_error = llm_error
+                consec_fail += 1
                 await self._add_lesson(task, "", llm_error, notebook)
                 if i - last_improve_iter >= patience:
+                    if await maybe_replan(i):
+                        continue
                     break
                 continue
             if not proof:
                 last_error = "empty proof"
+                consec_fail += 1
                 await self._add_lesson(
                     task, "", "empty proof extracted from LLM reply", notebook
                 )
                 if i - last_improve_iter >= patience:
+                    if await maybe_replan(i):
+                        continue
                     break
                 continue
 
@@ -103,8 +208,11 @@ class AxProverV2:
                 vr = await self.verifier.verify_proof(task, proof)
             except Exception as exc:
                 last_error = f"verifier error: {exc}"
+                consec_fail += 1
                 await self._add_lesson(task, proof, last_error, notebook)
                 if i - last_improve_iter >= patience:
+                    if await maybe_replan(i):
+                        continue
                     break
                 continue
 
@@ -113,6 +221,7 @@ class AxProverV2:
                 if best_remaining is None or rem < best_remaining:
                     best_remaining = rem
                     last_improve_iter = i
+                    consec_fail = 0
 
             if getattr(vr, "ok", False):
                 # Success path: CRITIC cross-review (mutual evaluation).
@@ -120,6 +229,7 @@ class AxProverV2:
                 if self.emergence is not None:
                     self.emergence.cross_eval(task.id, agree=bool(approved))
                 if approved:
+                    await self._cache_store(task, proof)
                     self.notebook = list(notebook)  # introspection mirror
                     return ResolutionResult(
                         task_id=task.id,
@@ -134,17 +244,22 @@ class AxProverV2:
                         verification_passed=True,  # grounded in vr.ok above
                     )
                 last_error = f"critic rejected: {note}"
+                consec_fail += 1
                 self._push_lesson(notebook, f"critic: {note}"[:_LESSON_CHARS], "")
             else:
                 diagnostics = getattr(vr, "diagnostics", "") or getattr(
                     vr, "error", ""
                 ) or "verification failed"
                 last_error = str(diagnostics)[:300]
+                consec_fail += 1
                 await self._add_lesson(task, proof, str(diagnostics), notebook)
 
             # Stall semantics (v39 P1-2 fix): consecutive rounds without
-            # remaining_sorries improvement.
+            # remaining_sorries improvement; before giving up, let the CRITIC
+            # switch the approach (frontier_atp Top-8 #5 dynamic replanning).
             if i - last_improve_iter >= patience:
+                if await maybe_replan(i):
+                    continue
                 logger.info(
                     "axprover %s: stall %d >= patience %d -> break",
                     task.id,
@@ -169,8 +284,90 @@ class AxProverV2:
 
     # ------------------------------------------------------------ internals
 
+    async def _apollo_attempt(
+        self, task: SorryTask, strategy, notebook: list[tuple[str, str]]
+    ) -> Optional[str]:
+        """Run APOLLO decomposition (Top-8 #4); never raises."""
+        try:
+            return await self._get_decomposer().attempt(
+                task, strategy=strategy, notebook=notebook
+            )
+        except Exception as exc:
+            logger.info("axprover %s: apollo attempt failed: %r", task.id, exc)
+            return None
+
+    async def _cache_lookup(self, task: SorryTask) -> Optional[str]:
+        """Shared-lemma-cache probe before any proving (Top-8 #5)."""
+        if self.lemma_cache is None:
+            return None
+        goal = (task.goal_state or "").strip()
+        if not goal:
+            return None
+        try:
+            hit = await self.lemma_cache.get(goal)
+        except Exception as exc:
+            logger.debug("lemma cache lookup failed: %r", exc)
+            return None
+        if hit and isinstance(hit, dict) and hit.get("proof"):
+            return str(hit["proof"])
+        return None
+
+    async def _try_cached_proof(
+        self, task: SorryTask, proof: str, t0: float
+    ) -> Optional[ResolutionResult]:
+        """A cache hit is only a candidate: re-verify + critic review before
+        booking success (no self-signed successes, v39 P0-3)."""
+        try:
+            vr = await self.verifier.verify_proof(task, proof)
+        except Exception as exc:
+            logger.info("cached proof verify error on %s: %r", task.id, exc)
+            return None
+        if not getattr(vr, "ok", False):
+            logger.info(
+                "axprover %s: cached proof failed re-verification; solving fresh",
+                task.id,
+            )
+            return None
+        approved, note = await self.critic.review_proof(task, proof)
+        if self.emergence is not None:
+            self.emergence.cross_eval(task.id, agree=bool(approved))
+        if not approved:
+            logger.info("axprover %s: cached proof critic-rejected: %s", task.id, note)
+            return None
+        logger.info("axprover %s: lemma cache hit -> short-circuit", task.id)
+        return ResolutionResult(
+            task_id=task.id,
+            success=True,
+            status=ProofStatus.SOLVED_AGENTIC,
+            proof=proof,
+            solver="axprover_v2_cache",
+            iterations=0,
+            tokens_used=0,
+            time_elapsed=time.monotonic() - t0,
+            remaining_goals=0,
+            verification_passed=True,  # grounded in vr.ok above
+        )
+
+    async def _cache_store(self, task: SorryTask, proof: str) -> None:
+        if self.lemma_cache is None:
+            return
+        goal = (task.goal_state or "").strip()
+        if not goal or not (proof or "").strip():
+            return
+        try:
+            await self.lemma_cache.put(
+                goal, proof, meta={"solver": "axprover_v2", "task_id": task.id}
+            )
+        except Exception as exc:
+            logger.debug("lemma cache store failed: %r", exc)
+
     async def _propose(
-        self, task: SorryTask, prover, strategy, notebook: list[tuple[str, str]]
+        self,
+        task: SorryTask,
+        prover,
+        strategy,
+        notebook: list[tuple[str, str]],
+        plan: str = "",
     ):
         thinking = bool(getattr(strategy, "enable_thinking", False))
         max_tokens = (
@@ -203,13 +400,23 @@ class AxProverV2:
             "Produce a complete Lean 4 proof. Respond with Lean code only, "
             "inside a ```lean fenced block."
         )
+        system_prompt = (
+            "You are an expert Lean 4 prover. Output only Lean code. "
+            "Never use sorry/admit."
+        )
+        if plan:
+            # Dynamic replanning (frontier_atp Top-8 #5): the CRITIC's
+            # approach-switch plan steers this round away from the stalled
+            # approach.
+            system_prompt += (
+                "\nThe previous approach stalled. Follow this alternative "
+                "high-level plan (APPROACH SWITCH) unless clearly "
+                "inapplicable:\n" + plan
+            )
         try:
             resp = await prover.generate(
                 prompt,
-                system_prompt=(
-                    "You are an expert Lean 4 prover. Output only Lean code. "
-                    "Never use sorry/admit."
-                ),
+                system_prompt=system_prompt,
                 temperature=0.3,
                 max_tokens=max_tokens,
                 thinking=thinking,

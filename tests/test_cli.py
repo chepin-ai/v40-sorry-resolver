@@ -199,3 +199,125 @@ async def test_health_gate_passes_then_pipeline_runs(
     report = json.loads(runs[-1].read_text(encoding="utf-8"))
     assert report["solved"] == 1
     assert report["results"][0]["unverified"] is True  # --verifier mock
+
+
+# ------------------------------------------------- roadmap: 0-sorry exit
+
+
+@pytest.fixture()
+def sorry_free_project(tmp_path):
+    """mathlib-style CI-clean project: 'sorry' only in comments/strings."""
+    proj = tmp_path / "clean_proj"
+    proj.mkdir()
+    (proj / "lakefile.toml").write_text('name = "clean"\n')
+    (proj / "Basic.lean").write_text(
+        "-- this file enforces the no-sorry policy\n"
+        "/- /- nested sorry mention -/ -/\n"
+        "theorem clean_trivial : True := by\n"
+        "  trivial\n"
+        'def note := "sorry is not allowed"\n'
+    )
+    return str(proj)
+
+
+def test_zero_sorry_graceful_exit(sorry_free_project, tmp_path, capsys, no_dotenv):
+    """0 sorries is legitimate (mathlib CI): friendly message + stats, exit 0,
+    and no health check / verifier init happens."""
+    rc = cli.main(
+        _argv(sorry_free_project, tmp_path / "work", "--mock-llm", "--verifier", "mock")
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "未发现 sorry" in out
+    assert "mathlib" in out
+    assert "扫描文件数=1" in out
+    assert "定理/声明数=" in out
+    # No pipeline/verifier output: the run stopped right after the scan.
+    assert "[UNVERIFIED]" not in out
+
+
+def test_zero_sorry_graceful_exit_dry_run(
+    sorry_free_project, tmp_path, capsys, no_dotenv
+):
+    """The graceful 0-sorry exit also short-circuits --dry-run health checks."""
+    rc = cli.main(
+        _argv(sorry_free_project, tmp_path / "work", "--dry-run", "--mock-llm")
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "未发现 sorry" in out
+    assert "[dry-run] llm health:" not in out
+
+
+# ------------------------------------------------- roadmap: --sorrydb source
+
+
+def _write_sorrydb_snapshot(path):
+    payload = {
+        "repos": [{"remote": "https://github.com/acme/leanproj", "commit": "abc123"}],
+        "sorries": [
+            {
+                "id": "sdb-1",
+                "repo": {"remote": "https://github.com/acme/leanproj", "commit": "abc123"},
+                "location": {"path": "Proj/A.lean", "start_line": 12, "start_column": 3},
+                "debug_info": {"goal": "1 + 1 = 2", "url": "https://sorrydb.org/x"},
+                "metadata": {},
+            },
+            {
+                "id": "sdb-2",
+                "repo": {"remote": "https://github.com/acme/leanproj", "commit": "abc123"},
+                "location": {"path": "Proj/B.lean", "start_line": 30, "start_column": 5},
+                "debug_info": {"goal": "True"},
+                "metadata": {},
+            },
+        ],
+    }
+    path.write_text(json.dumps(payload))
+    return str(path)
+
+
+def test_sorrydb_source_dry_run(tmp_path, capsys, no_dotenv):
+    """--sorrydb loads tasks via SorryDBClient instead of scanning paths."""
+    snap = _write_sorrydb_snapshot(tmp_path / "snapshot.json")
+    rc = cli.main(
+        [
+            "--sorrydb",
+            snap,
+            "--output-dir",
+            str(tmp_path / "work"),
+            "--log-level",
+            "WARNING",
+            "--dry-run",
+            "--mock-llm",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[dry-run] tasks=2" in out
+    assert "Proj/A.lean" in out and "Proj/B.lean" in out
+
+
+def test_sorrydb_and_project_paths_mutually_exclusive(tmp_path, no_dotenv):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--sorrydb", "x.json", "--project-paths", "y", "--dry-run"])
+    assert excinfo.value.code == 2
+
+
+def test_project_alias_for_project_paths(fake_lean_project, tmp_path, capsys, no_dotenv):
+    """--project is accepted as an alias of --project-paths (Kaggle command)."""
+    rc = cli.main(
+        [
+            "--project",
+            fake_lean_project,
+            "--output-dir",
+            str(tmp_path / "work"),
+            "--log-level",
+            "WARNING",
+            "--dry-run",
+            "--mock-llm",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[dry-run] tasks=1" in out
+    assert "cli_trivial" in out

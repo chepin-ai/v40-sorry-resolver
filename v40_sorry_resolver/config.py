@@ -116,6 +116,25 @@ class V40Config:
     # Critic/AxProver prompts. Default OFF; failures degrade to [] + WARNING
     # and never block the solving flow.
     retrieval_enabled: bool = False
+    # APOLLO sub-lemma decomposition (frontier_atp Top-8 #4, arXiv:2505.05758):
+    # after >=2 consecutive agentic failures, the Prover decomposes the goal
+    # into <=apollo_max_sublemmas `have h_i : P_i := by sorry` sub-lemmas; each
+    # is verified in isolation, failed ones are re-proven individually (one
+    # recursive level allowed), then the skeleton is reassembled and re-verified.
+    apollo_enabled: bool = True
+    apollo_max_sublemmas: int = 3
+    apollo_sublemma_retries: int = 2
+    apollo_recursive: bool = True
+    # Shared lemma cache (frontier_atp Top-8 #5, BFS-Prover-V2 Planner-Prover):
+    # goal-normalized sha256 -> verified proof, persisted via Cache and shared
+    # across workers; consulted before any proving attempt, written on success.
+    lemma_cache_enabled: bool = True
+    # Dynamic replanning (frontier_atp Top-8 #5): when the agentic loop stalls
+    # (>=agentic_stall_patience rounds without improvement), the CRITIC emits
+    # an alternative high-level plan (approach switch) injected into the next
+    # round's system prompt instead of giving up immediately. This is the max
+    # number of replans per task before the loop really breaks.
+    replan_max: int = 2
     # LLM
     providers: dict = field(default_factory=dict)  # filled by from_env
     llm_temperature: float = 0.3
@@ -267,6 +286,18 @@ class V40Config:
                 f"search_length_norm_alpha must be >= 0, "
                 f"got {self.search_length_norm_alpha}"
             )
+        if self.apollo_max_sublemmas < 1:
+            problems.append(
+                f"apollo_max_sublemmas must be >= 1, "
+                f"got {self.apollo_max_sublemmas}"
+            )
+        if self.apollo_sublemma_retries < 0:
+            problems.append(
+                f"apollo_sublemma_retries must be >= 0, "
+                f"got {self.apollo_sublemma_retries}"
+            )
+        if self.replan_max < 0:
+            problems.append(f"replan_max must be >= 0, got {self.replan_max}")
         if self.checkpoint_interval_tasks < 1:
             problems.append(
                 f"checkpoint_interval_tasks must be >= 1, "

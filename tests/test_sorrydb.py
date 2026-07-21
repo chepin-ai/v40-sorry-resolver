@@ -458,3 +458,103 @@ def test_theorem_facts_counts_sorries_and_statement(tmp_path):
     stmt, count = verifier._theorem_facts(text, "multi", 3)
     assert count == 2  # comment occurrence is stripped
     assert stmt == "theorem multi (n : Nat) : n = n"
+
+
+# --------------------------------------- roadmap: comment/string-aware scan
+
+
+def test_string_literal_sorry_not_counted(tmp_path):
+    """`sorry` inside a string literal is not a real sorry (Kaggle 2026-07-21
+    mathlib false positive: Basic.lean:149 was inside a string/comment)."""
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "S.lean").write_text(
+        'theorem real_one : True := by\n'
+        '  trivial\n'
+        'def msg : String := "do not leave sorry in proofs"\n'
+        'def msg2 := "escaped \\" sorry quote"\n'
+        'theorem real_two : 1 = 1 := by\n'
+        '  sorry\n'
+    )
+    found = SorryScanner().scan([str(tmp_path)])
+    assert [t.theorem_name for t in found] == ["real_two"]
+    assert found[0].line_number == 6  # real file line, not a stripped-text line
+
+
+def test_nested_block_comment_sorry_not_counted(tmp_path):
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "N.lean").write_text(
+        "/- outer sorry\n"
+        "   /- inner sorry -/\n"
+        "   still outer sorry -/\n"
+        "theorem t : True := by\n"
+        "  trivial\n"
+    )
+    assert SorryScanner().scan([str(tmp_path)]) == []
+
+
+def test_example_decl_is_sorry_container(tmp_path):
+    """Nameless `example` declarations are collected as sorry containers."""
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "E.lean").write_text(
+        "example : True := by\n"
+        "  sorry\n"
+        "example (n : Nat) : n + 0 = n := by\n"
+        "  sorry\n"
+    )
+    found = SorryScanner().scan([str(tmp_path)])
+    assert len(found) == 2
+    assert all(t.theorem_name.startswith("example_") for t in found)
+    assert found[0].line_number == 2 and found[1].line_number == 4
+    assert found[1].goal_state == "n + 0 = n"
+
+
+def test_nameless_instance_is_sorry_container(tmp_path):
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "I.lean").write_text(
+        "instance : Inhabited Nat := by\n"
+        "  sorry\n"
+    )
+    found = SorryScanner().scan([str(tmp_path)])
+    assert len(found) == 1
+    assert found[0].theorem_name.startswith("instance_")
+    assert found[0].goal_state == "Inhabited Nat"
+
+
+def test_def_sorry_recorded_with_warning(tmp_path, caplog):
+    """def sorries are recorded but flagged (verification splices by theorem)."""
+    import logging
+
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "D.lean").write_text(
+        "def compute : Nat := by\n"
+        "  sorry\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        found = SorryScanner().scan([str(tmp_path)])
+    assert len(found) == 1
+    assert found[0].theorem_name == "compute"
+    assert any("inside a `def`" in r.message for r in caplog.records)
+
+
+def test_mathlib_style_file_yields_zero_tasks_with_stats(tmp_path):
+    """mathlib CI enforces zero sorries; the word 'sorry' appears in comments
+    and docstrings. The scan must return 0 tasks and still report stats."""
+    (tmp_path / "lakefile.toml").write_text('name = "x"\n')
+    (tmp_path / "Basic.lean").write_text(
+        "/-! # Category theory basics\n"
+        "This module used to contain a `sorry`, removed upstream. -/\n"
+        "-- See the sorry-free policy in mathlib CI.\n"
+        "theorem id_comp : True := by\n"
+        "  trivial\n"
+        "/- multi\n"
+        "   /- nested sorry mention -/\n"
+        "   line -/\n"
+        "lemma comp_id : True := by\n"
+        "  trivial\n"
+        'def note := "sorry is forbidden here"\n'
+    )
+    scanner = SorryScanner()
+    assert scanner.scan([str(tmp_path)]) == []
+    assert scanner.last_stats["files"] >= 1
+    assert scanner.last_stats["declarations"] >= 2
+    assert scanner.last_stats["sorries"] == 0

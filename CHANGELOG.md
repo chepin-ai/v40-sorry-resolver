@@ -2,6 +2,68 @@
 
 All notable changes to the v40 sorry resolver are documented here.
 
+## [Unreleased] — agentic roadmap (2026-07-21, feat-roadmap-agentic)
+
+Roadmap items from `LOCAL_GUIDE.md` §7 + `frontier_atp.md` Top-8 #2/#4/#5,
+triggered by the 2026-07-21 Kaggle mathlib scan (CategoryTheory `Basic.lean:149`
+"sorry" was inside a comment/string — 0 real sorries is the *legitimate*
+mathlib CI state).
+
+### Added
+
+- **Comment/string-aware sorry scanner** (`sorrydb.py`): `_strip_comments` now
+  also blanks string-literal bodies (positions preserved, so line/column still
+  point at the real file); nameless `example : P := ...` and
+  `instance : C := ...` declarations are collected as sorry containers
+  (synthesized stable names `example_<line>`/`instance_<line>`); a sorry inside
+  a `def` is recorded but logged with a WARNING (the verification path splices
+  by theorem/lemma); `SorryScanner.last_stats` reports
+  files/declarations/sorries scanned. A mathlib-style file whose "sorry"s live
+  in comments/strings now yields 0 tasks with an explanatory INFO, not
+  alarmist WARNINGs.
+- **0-sorry graceful CLI exit** (`cli.py`): when the task source yields zero
+  sorries the CLI prints "该项目未发现 sorry（若目标是 mathlib 等 CI 强制无
+  sorry 的库属正常）" plus project stats (files/declarations scanned) and exits
+  0 immediately — no health check, no verifier init.
+- **CLI `--sorrydb` / `--project` wiring** (`cli.py`): `--sorrydb <path|URL>`
+  switches the task source to `SorryDBClient.load()` (mutually exclusive with
+  `--project-paths`); `--project` is now an alias of `--project-paths` (the
+  form used by the Kaggle command line).
+- **APOLLO sub-lemma decomposition** (`engine/decompose.py`, new;
+  `engine/axprover.py`; frontier_atp Top-8 #4, arXiv:2505.05758): after ≥2
+  consecutive agentic failures (config `apollo_enabled`, default on) the PROVER
+  decomposes the goal into ≤`apollo_max_sublemmas` (default 3)
+  `have h_i : P_i := by sorry` sub-lemmas + a closing skeleton. Each sub-lemma
+  is verified **in isolation** (a synthetic `<parent>_apollo_<h_i>` theorem in
+  a throwaway copy of the source file — the original is never touched and temp
+  files are cleaned up); failed sub-lemmas are re-proven individually with the
+  remaining budget (`apollo_sublemma_retries`, default 2) and may be decomposed
+  one recursive level (`apollo_recursive`, default on). Only when every
+  sub-lemma verifies is the skeleton reassembled and the full proof verified
+  end-to-end.
+- **Shared lemma cache** (`engine/lemma_cache.py`, new; frontier_atp Top-8 #5,
+  BFS-Prover-V2 shared Subgoal Cache): `LemmaCache` over the persistent
+  `Cache`, key = sha256 of the whitespace-normalized goal, value = verified
+  proof + metadata. One instance per pipeline run is shared across workers;
+  sub-lemma / direct / search / agentic successes are all written, and every
+  task checks the cache *before* proving — a hit short-circuits the whole
+  phase chain (still subject to the mandatory re-verification, v39 P0-3).
+  Config `lemma_cache_enabled` (default on).
+- **CRITIC approach-switch replanning** (`engine/agents.py`,
+  `engine/axprover.py`; frontier_atp Top-8 #5 dynamic replanning): when the
+  agentic loop stalls (`≥ agentic_stall_patience` rounds without improvement),
+  the CRITIC now proposes an alternative high-level plan — an approach switch
+  (different lemma path / strategy family) — which is injected into the next
+  round's system prompt and recorded as a `replan:` notebook lesson, up to
+  `replan_max` (default 2) times per task before the loop really breaks.
+
+### Changed
+
+- `tests/test_axprover.py::test_stall_breaks_at_patience` now pins
+  `replan_max = 0` / `apollo_enabled = False` to keep testing the pre-roadmap
+  stall semantics (the new defaults intentionally extend the loop with
+  replanning).
+
 ## [Unreleased] — frontier integration (2026-07)
 
 Integrates the **verified actionable items** from the 2026-07 frontier research

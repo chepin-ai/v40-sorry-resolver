@@ -110,6 +110,79 @@ class CriticAgent:
             logger.debug("critic summarize failed: %s", exc)
         return self._heuristic_lesson(diagnostics)
 
+    async def propose_alternative(
+        self,
+        task: SorryTask,
+        lessons: Optional[list] = None,
+        last_error: str = "",
+    ) -> str:
+        """Dynamic replanning (frontier_atp Top-8 #5; BFS-Prover-V2/Hilbert/
+        Delta-Prover): when the prover is stalled, output ONE alternative
+        high-level plan — an *approach switch* (different lemma path, different
+        strategy family: induction/contradiction/term-mode/simp-set/...), not
+        just another lesson. Injected into the next round's system prompt.
+
+        Always returns a non-empty plan (heuristic fallback when the LLM is
+        unavailable) so the replan is never a no-op.
+        """
+        system = (
+            "You are a strict Lean 4 proof critic. The current proof approach "
+            "is STALLED. Propose ONE alternative high-level approach — an "
+            "approach switch: a different lemma path or a different strategy "
+            "family (e.g. induction on another variable, proof by "
+            "contradiction, term-mode construction, a simp/omega/decide "
+            "automation-first attempt, or a different decomposition). Reply "
+            "with at most 3 short lines, <=400 characters total, starting "
+            "with 'APPROACH SWITCH:'."
+        )
+        lesson_lines = []
+        for entry in (lessons or [])[-3:]:
+            # notebook entries are (lesson, raw_diagnostics) pairs or strings
+            lesson_lines.append(str(entry[0] if isinstance(entry, tuple) else entry))
+        prompt = (
+            f"Theorem {task.theorem_name}.\n"
+            f"Goal: {(task.goal_state or '(unknown)')[:400]}\n"
+            f"Recent lessons from failed attempts:\n"
+            + ("\n".join(f"- {l}" for l in lesson_lines) or "- (none)")
+            + f"\nLast error: {(last_error or '(none)')[:300]}\n"
+            "Propose the alternative high-level plan now."
+        )
+        try:
+            resp = await self.router.client(Role.CRITIC).generate(
+                prompt,
+                system_prompt=system,
+                temperature=0.4,
+                max_tokens=256,
+                cache_key=None,
+            )
+            text = "" if getattr(resp, "error", None) else getattr(resp, "text", "")
+            plan = self._clean_plan(text)
+            if plan:
+                return plan
+        except Exception as exc:
+            logger.debug("critic propose_alternative failed: %s", exc)
+        return self._heuristic_plan(task, lessons)
+
+    @staticmethod
+    def _clean_plan(text: str) -> str:
+        if not text or not text.strip():
+            return ""
+        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        plan = "\n".join(lines[:3])[:400]
+        if not plan.upper().startswith("APPROACH SWITCH"):
+            plan = "APPROACH SWITCH: " + plan
+        return plan[:400]
+
+    @staticmethod
+    def _heuristic_plan(task: SorryTask, lessons: Optional[list]) -> str:
+        return (
+            "APPROACH SWITCH: abandon the current tactic chain; try a "
+            "different strategy family — e.g. automation first "
+            "(simp/omega/decide), induction on the main variable, or a "
+            "term-mode proof — and route the key step through a different "
+            "lemma than before."
+        )[:400]
+
     async def review_proof(self, task: SorryTask, proof: str) -> tuple[bool, str]:
         """Cross-review a verified proof: local blacklist re-check + LLM review."""
         # Local blacklist re-check first (defense in depth, no LLM needed).

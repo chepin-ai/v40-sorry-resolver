@@ -27,16 +27,27 @@ from .models import PriorityLevel, SorryTask  # SPEC 3.1 contract (provided by M
 
 logger = logging.getLogger(__name__)
 
-# Enclosing declaration for a sorry (nearest match above wins).
+# Enclosing declaration for a sorry (nearest match above wins). The name is
+# optional: Lean 4 allows nameless ``example : P := ...`` and nameless
+# ``instance : C := ...`` declarations; those get a synthesized name at scan
+# time so they can serve as sorry containers too.
 _DECL_RE = re.compile(
-    r"^[ \t]*(theorem|lemma|def|instance|example|abbrev)[ \t]+([^\s(\[{:=]+)"
+    r"^[ \t]*(theorem|lemma|def|instance|example|abbrev)(?:[ \t]+([^\s(\[{:=]+))?"
 )
 _SORRY_RE = re.compile(r"\bsorry\b")
 _LAKEFILE_NAMES = ("lakefile.toml", "lakefile.lean")
 
 
 def _strip_comments(text: str) -> str:
-    """Blank out Lean comments, preserving positions (shared logic, see verify)."""
+    """Blank out Lean comments AND string-literal bodies, preserving positions.
+
+    Position preservation (1:1 char mapping, newlines kept) means line/column
+    numbers computed on the stripped text still point at the real lines of the
+    original file. Blanking string bodies fixes false positives like
+    ``log "sorry not allowed"`` being detected as a sorry (Kaggle 2026-07-21:
+    mathlib4 CategoryTheory Basic.lean:149 was a comment/string false hit —
+    mathlib CI enforces zero real sorries).
+    """
     out = list(text)
     i, n = 0, len(text)
     depth = 0
@@ -45,10 +56,16 @@ def _strip_comments(text: str) -> str:
         c = text[i]
         if in_string:
             if c == "\\":
+                # Escape sequence: blank both chars (positions preserved).
+                out[i] = " "
+                if i + 1 < n and text[i + 1] != "\n":
+                    out[i + 1] = " "
                 i += 2
                 continue
             if c == '"':
                 in_string = False
+            if c != "\n":
+                out[i] = " "
             i += 1
             continue
         if depth > 0:
@@ -68,6 +85,7 @@ def _strip_comments(text: str) -> str:
             continue
         if c == '"':
             in_string = True
+            out[i] = " "
             i += 1
             continue
         if text.startswith("--", i):
@@ -97,8 +115,15 @@ def _find_project_root(start: Path) -> Path:
 class SorryScanner:
     """Scan Lean projects for ``sorry`` placeholders -> ``list[SorryTask]``."""
 
+    def __init__(self) -> None:
+        # Populated by scan(): {"files": int, "declarations": int, "sorries": int}.
+        # Lets the CLI print a meaningful project summary when 0 sorries are
+        # found (e.g. mathlib-style CI-clean trees) instead of bare warnings.
+        self.last_stats: dict = {"files": 0, "declarations": 0, "sorries": 0}
+
     def scan(self, paths: list[str]) -> list[SorryTask]:
         tasks: list[SorryTask] = []
+        stats = {"files": 0, "declarations": 0, "sorries": 0}
         for raw in paths or []:
             root = Path(raw)
             if not root.exists():
@@ -106,11 +131,26 @@ class SorryScanner:
                 continue
             for lean_file in self._iter_lean_files(root):
                 try:
-                    tasks.extend(self._scan_file(lean_file))
+                    file_tasks, file_decls = self._scan_file(lean_file)
                 except OSError as exc:
                     logger.warning("SorryScanner: cannot read %s: %r", lean_file, exc)
+                    continue
+                stats["files"] += 1
+                stats["declarations"] += file_decls
+                tasks.extend(file_tasks)
+        stats["sorries"] = len(tasks)
+        self.last_stats = stats
         if not tasks:
-            logger.warning("SorryScanner: no sorries found in %s (returning [])", list(paths or []))
+            # 0 sorries is a *legitimate* result (mathlib CI enforces zero
+            # sorries); log at INFO with stats, not an alarming WARNING.
+            logger.info(
+                "SorryScanner: no sorries found in %s "
+                "(files=%d declarations=%d; this is normal for CI-clean "
+                "projects like mathlib)",
+                list(paths or []),
+                stats["files"],
+                stats["declarations"],
+            )
         return tasks
 
     # ------------------------------------------------------------------ walk
@@ -132,7 +172,8 @@ class SorryScanner:
         return sorted(files, key=lambda p: str(p))
 
     # ------------------------------------------------------------------ file
-    def _scan_file(self, lean_file: Path) -> list[SorryTask]:
+    def _scan_file(self, lean_file: Path) -> tuple[list[SorryTask], int]:
+        """Scan one file; return (tasks, declaration_count) for stats."""
         project_root = _find_project_root(lean_file)
         try:
             rel_file = str(lean_file.resolve().relative_to(project_root))
@@ -142,6 +183,7 @@ class SorryScanner:
         code = _strip_comments(original)
         orig_lines = original.split("\n")
         code_lines = code.split("\n")
+        decl_count = sum(1 for line in code_lines if _DECL_RE.match(line))
 
         priority = self._priority_for(rel_file, original)
         tasks: list[SorryTask] = []
@@ -153,10 +195,23 @@ class SorryScanner:
                 if decl is None:
                     logger.warning(
                         "SorryScanner: sorry at %s:%d has no enclosing "
-                        "theorem/lemma above; skipped", rel_file, line1,
+                        "declaration above; skipped", rel_file, line1,
                     )
                     continue
-                decl_idx, _kw, name = decl
+                decl_idx, kw, name = decl
+                if not name:
+                    # Nameless example/instance: synthesize a stable name.
+                    name = f"{kw}_{decl_idx + 1}"
+                if kw == "def":
+                    # Recorded, but flagged: the verification path splices
+                    # proofs by theorem/lemma, so a def sorry may need manual
+                    # handling downstream.
+                    logger.warning(
+                        "SorryScanner: sorry at %s:%d is inside a `def` (%s); "
+                        "recorded, but the verification path splices by "
+                        "theorem/lemma — treat with care",
+                        rel_file, line1, name,
+                    )
                 goal = self._extract_goal(code, code_lines, decl_idx)
                 context = "\n".join(orig_lines[decl_idx:line1]).strip("\n")
                 task_id = hashlib.sha1(
@@ -175,7 +230,7 @@ class SorryScanner:
                         priority=priority,
                     )
                 )
-        return tasks
+        return tasks, decl_count
 
     # ------------------------------------------------------------- analysis
     @staticmethod
@@ -204,7 +259,8 @@ class SorryScanner:
         decl_start = sum(len(l) + 1 for l in code_lines[:decl_idx])
         n = len(code)
         m = re.match(
-            r"\s*(?:theorem|lemma|def|instance|example|abbrev)\s+\S+",
+            # Name optional: nameless `example : P` / `instance : C` headers.
+            r"\s*(?:theorem|lemma|def|instance|example|abbrev)(?:\s+[^\s(\[{:=]+)?",
             code[decl_start:],
         )
         if not m:
@@ -281,6 +337,17 @@ class SorryDBClient:
     @property
     def enabled(self) -> bool:
         return bool(self._endpoint)
+
+    @classmethod
+    async def load(
+        cls,
+        endpoint: str,
+        project_path: str = "",
+        timeout_s: float = 10.0,
+    ) -> list[SorryTask]:
+        """One-shot convenience used by the CLI ``--sorrydb`` wiring: build a
+        client for ``endpoint`` (local path or URL) and fetch its tasks."""
+        return await cls(endpoint, timeout_s=timeout_s).fetch_tasks(project_path)
 
     async def fetch_tasks(self, project_path: str = "") -> list[SorryTask]:
         """Fetch snapshot sorries; on any failure log a WARNING and return []."""

@@ -276,6 +276,14 @@ class ResolutionPipeline:
         self.critic = CriticAgent(
             router, metrics=metrics, emergence=self.emergence, retriever=retriever
         )
+        # Shared lemma cache (frontier_atp Top-8 #5; BFS-Prover-V2 shared
+        # Subgoal Cache): one store per pipeline run, consulted before proving
+        # and written on every verified success, shared across workers.
+        self.lemma_cache = None
+        if cache is not None and bool(getattr(cfg, "lemma_cache_enabled", True)):
+            from v40_sorry_resolver.engine.lemma_cache import LemmaCache
+
+            self.lemma_cache = LemmaCache(cache)
         self.orchestrator_llm = OrchestratorLLM(
             router, base_strategy=strategy, emergence=self.emergence, metrics=metrics
         )
@@ -293,6 +301,7 @@ class ResolutionPipeline:
             cfg=cfg,
             emergence=self.emergence,
             retriever=retriever,
+            lemma_cache=self.lemma_cache,
         )
 
     # ------------------------------------------------------------------ API
@@ -648,6 +657,37 @@ class ResolutionPipeline:
     async def _phase_chain(self, task: SorryTask, strategy: StrategyConfig) -> ResolutionResult:
         tokens_used = 0
         last_error: Optional[str] = None
+
+        # Shared lemma cache (frontier_atp Top-8 #5): if another worker/phase
+        # already proved this exact goal, short-circuit — but only after the
+        # mandatory re-verification (no self-signed successes, v39 P0-3).
+        cached_proof = await self._lemma_cache_lookup(task)
+        if cached_proof:
+            try:
+                vr = await self.verifier.verify_proof(task, cached_proof)
+            except Exception as exc:
+                vr = None
+                last_error = f"verifier error: {exc}"
+            if vr is not None and getattr(vr, "ok", False):
+                task.status = ProofStatus.SOLVED_LLM_DIRECT
+                task.proof = cached_proof
+                self._record_attempt(task, "lemma_cache", True, None)
+                return ResolutionResult(
+                    task_id=task.id,
+                    success=True,
+                    status=ProofStatus.SOLVED_LLM_DIRECT,
+                    proof=cached_proof,
+                    solver="lemma_cache",
+                    verification_passed=True,
+                )
+            logger.info(
+                "lemma cache hit for %s failed re-verification; solving fresh",
+                task.id,
+            )
+            self._record_attempt(
+                task, "lemma_cache", False, "cached proof failed re-verification"
+            )
+
         for phase in strategy.phase_order:
             if self.shutdown_event.is_set():
                 task.status = ProofStatus.OPEN  # interrupted -> retried on resume
@@ -689,6 +729,9 @@ class ResolutionPipeline:
                 task.status = result.status
                 task.proof = result.proof
                 self._record_attempt(task, phase, True, None)
+                # Shared lemma cache write (Top-8 #5): direct/search/agentic
+                # successes all feed the worker-shared goal->proof store.
+                await self._lemma_cache_store(task, result.proof or "", result.solver)
                 return result
             result.success = False
             result.verification_passed = False
@@ -702,6 +745,36 @@ class ResolutionPipeline:
             tokens_used=tokens_used,
             error=last_error or "all phases exhausted",
         )
+
+    async def _lemma_cache_lookup(self, task: SorryTask) -> Optional[str]:
+        if self.lemma_cache is None:
+            return None
+        goal = (task.goal_state or "").strip()
+        if not goal:
+            return None
+        try:
+            hit = await self.lemma_cache.get(goal)
+        except Exception as exc:
+            logger.debug("lemma cache lookup failed: %r", exc)
+            return None
+        if hit and isinstance(hit, dict) and hit.get("proof"):
+            return str(hit["proof"])
+        return None
+
+    async def _lemma_cache_store(
+        self, task: SorryTask, proof: str, solver: str
+    ) -> None:
+        if self.lemma_cache is None:
+            return
+        goal = (task.goal_state or "").strip()
+        if not goal or not proof.strip():
+            return
+        try:
+            await self.lemma_cache.put(
+                goal, proof, meta={"solver": solver, "task_id": task.id}
+            )
+        except Exception as exc:
+            logger.debug("lemma cache store failed: %r", exc)
 
     async def _run_phase(
         self, phase: str, task: SorryTask, strategy: StrategyConfig

@@ -67,6 +67,10 @@ async def test_agentic_solves_on_second_iteration(make_task):
 async def test_stall_breaks_at_patience(make_task):
     class Cfg:
         agentic_stall_patience = 3
+        # Pin pre-roadmap semantics: no CRITIC approach-switch replans
+        # (replan_max, feat-roadmap-agentic) and no APOLLO decomposition.
+        replan_max = 0
+        apollo_enabled = False
 
     router = _router("junk proof")
     # remaining_sorries constant -> never improves.
@@ -239,3 +243,70 @@ async def test_raw_diagnostics_truncated_to_500_chars(make_task):
         assert len(lesson) <= 200
         assert len(diag) <= 500
     assert solver.notebook[-1][1] == "E" * 500
+
+
+# --------------------------------------- roadmap: approach-switch replanning
+
+
+@pytest.mark.asyncio
+async def test_stall_triggers_approach_switch_replan(make_task):
+    """Dynamic replanning (frontier_atp Top-8 #5): at stall, the CRITIC emits
+    an alternative high-level plan injected into the NEXT round's system
+    prompt instead of breaking immediately."""
+
+    class Cfg:
+        agentic_stall_patience = 2
+        replan_max = 1
+        apollo_enabled = False
+
+    prover = FakeLLMClient(Role.PROVER, script="junk proof")
+
+    def critic_script(prompt, system_prompt, role, idx):
+        blob = f"{system_prompt or ''} {prompt}".lower()
+        if "review" in blob:
+            return '{"approved": true, "reason": "ok"}'
+        if "approach switch" in blob or "alternative high-level" in blob:
+            return "use induction on n instead of the simp chain"
+        return "strategy: try a simpler tactic"
+
+    router = FakeRouter(
+        {
+            Role.PROVER: prover,
+            Role.CRITIC: FakeLLMClient(Role.CRITIC, script=critic_script),
+        }
+    )
+    solver = AxProverV2(router, FakeVerifier(remaining=1), cfg=Cfg())
+
+    result = await solver.solve(make_task(0), _strategy(max_iter=6))
+
+    assert result.success is False
+    # iters 0,1,2 (stall at 2 -> replan), 3,4 (stall at 4 -> replan budget
+    # exhausted -> break) => 5 iterations instead of 3 without replanning.
+    assert result.iterations == 5, result.iterations
+    # The round after the replan carried the CRITIC's approach-switch plan in
+    # its system prompt.
+    replanned_calls = [
+        c for c in prover.calls if "APPROACH SWITCH" in (c["system_prompt"] or "")
+    ]
+    assert replanned_calls, "no prover call carried the approach-switch plan"
+    assert any(
+        "induction" in c["system_prompt"] for c in replanned_calls
+    )
+    # The replan is visible in the notebook as a lesson.
+    assert any(pair[0].startswith("replan:") for pair in solver.notebook)
+
+
+@pytest.mark.asyncio
+async def test_replan_fallback_when_critic_unavailable(make_task):
+    """propose_alternative always returns a non-empty APPROACH SWITCH plan,
+    even when the CRITIC LLM is broken (heuristic fallback)."""
+    from v40_sorry_resolver.engine.agents import CriticAgent
+
+    class _BrokenClient:
+        async def generate(self, *a, **k):
+            raise RuntimeError("critic down")
+
+    critic = CriticAgent(FakeRouter({Role.CRITIC: _BrokenClient()}))
+    plan = await critic.propose_alternative(make_task(0), [], "some error")
+    assert plan.startswith("APPROACH SWITCH")
+    assert len(plan) <= 400
