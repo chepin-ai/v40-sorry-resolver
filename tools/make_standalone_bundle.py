@@ -280,7 +280,17 @@ def _download(urls, dest, timeout=300, connect_timeout=30, min_rate_kbps=8,
                 req = urllib.request.Request(url, headers=headers)
                 start = time.monotonic()
                 got = 0
-                with urllib.request.urlopen(req, timeout=connect_timeout) as resp:
+                try:
+                    resp_ctx = urllib.request.urlopen(req, timeout=connect_timeout)
+                except urllib.error.HTTPError as http_exc:
+                    # A 416 on a Range request means the cached file is already
+                    # complete (e.g. download finished but the toolchain
+                    # install was interrupted afterwards) — accept it.
+                    if http_exc.code == 416 and resume_from > 0:
+                        _log(f"cached download already complete ({resume_from} bytes)")
+                        return url
+                    raise
+                with resp_ctx as resp:
                     status = getattr(resp, "status", 200) or 200
                     if resume_from and status != 206:
                         resume_from = 0  # server ignored Range; start over

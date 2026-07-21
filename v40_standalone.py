@@ -1980,7 +1980,7 @@ LEAN_VERSION = "4.20.0"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.20.0"
 # Full package-CLI help, captured at bundle build time so that `--help`
 # works with zero third-party dependencies installed.
-CLI_HELP = 'usage: v40_sorry_resolver [-h] [--project-paths PATH | --sorrydb PATH_OR_URL]\n                          [--workers WORKERS]\n                          [--verifier {subprocess,dojo,repl,hybrid,lean_interact,mock}]\n                          [--wall-clock-budget SECONDS]\n                          [--task-limit TASK_LIMIT] [--resume | --no-resume]\n                          [--output-dir OUTPUT_DIR] [--dry-run] [--mock-llm]\n                          [--log-level {DEBUG,INFO,WARNING,ERROR}]\n\nv40 async Lean 4 sorry resolution engine\n\noptions:\n  -h, --help            show this help message and exit\n  --project-paths PATH, --project PATH\n                        Lean project root(s); repeatable (`--project` is an\n                        alias). Overrides config lean_project_paths.\n  --sorrydb PATH_OR_URL\n                        SorryDB snapshot (local JSON/JSONL file or http(s)\n                        URL) as the task source instead of scanning local\n                        project paths. Mutually exclusive with --project-\n                        paths.\n  --workers WORKERS     parallel worker count\n  --verifier {subprocess,dojo,repl,hybrid,lean_interact,mock}\n                        verification backend\n  --wall-clock-budget SECONDS\n                        global wall-clock budget\n  --task-limit TASK_LIMIT\n                        cap number of tasks solved\n  --resume\n  --no-resume\n  --output-dir OUTPUT_DIR\n                        work_dir for cache/checkpoint/results\n  --dry-run             scan tasks + health check only; no solving\n  --mock-llm            use deterministic fake LLM for ALL roles (testing;\n                        never mixed with real provider keys)\n  --log-level {DEBUG,INFO,WARNING,ERROR}\n'
+CLI_HELP = "v40 standalone (package CLI help unavailable at build time: No module named 'openai'). Forwarded options: --project/--project-paths, --sorrydb, --workers, --verifier, --wall-clock-budget, --task-limit, --resume/--no-resume, --output-dir, --dry-run, --mock-llm."
 GHFAST_PREFIX = "https://ghfast.top/"
 TUNA_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 PYPI_INDEX = "https://pypi.org/simple"
@@ -2162,7 +2162,17 @@ def _download(urls, dest, timeout=300, connect_timeout=30, min_rate_kbps=8,
                 req = urllib.request.Request(url, headers=headers)
                 start = time.monotonic()
                 got = 0
-                with urllib.request.urlopen(req, timeout=connect_timeout) as resp:
+                try:
+                    resp_ctx = urllib.request.urlopen(req, timeout=connect_timeout)
+                except urllib.error.HTTPError as http_exc:
+                    # A 416 on a Range request means the cached file is already
+                    # complete (e.g. download finished but the toolchain
+                    # install was interrupted afterwards) — accept it.
+                    if http_exc.code == 416 and resume_from > 0:
+                        _log(f"cached download already complete ({resume_from} bytes)")
+                        return url
+                    raise
+                with resp_ctx as resp:
                     status = getattr(resp, "status", 200) or 200
                     if resume_from and status != 206:
                         resume_from = 0  # server ignored Range; start over
