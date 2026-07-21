@@ -239,6 +239,10 @@ def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20):
             with urllib.request.urlopen(req, timeout=timeout) as resp, open(
                 dest, "wb"
             ) as fh:
+                try:
+                    expected = int(resp.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    expected = 0
                 while True:
                     chunk = resp.read(1 << 16)
                     if not chunk:
@@ -252,6 +256,10 @@ def _download(urls, dest, timeout=300, min_rate_kbps=32, stall_window=20):
                             raise _StalledDownload(
                                 f"{rate:.1f} KiB/s < {min_rate_kbps} KiB/s"
                             )
+            if expected and got != expected:
+                raise _StalledDownload(
+                    f"truncated download: {got} of {expected} bytes"
+                )
             if got > 0 and os.path.getsize(dest) > 0:
                 _log(f"downloaded {got / 1e6:.1f} MB in {time.monotonic() - start:.0f}s")
                 return url
@@ -337,6 +345,7 @@ def _ensure_zstandard():
         pass
     _log("no zstd binary; installing python zstandard for tarfile unpack")
     if _pip_install(["zstandard"]):
+        _refresh_site_paths()
         try:
             import zstandard  # noqa: F401
 
