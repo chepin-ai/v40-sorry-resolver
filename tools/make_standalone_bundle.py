@@ -358,7 +358,7 @@ def _unpack_tar_zst(archive, dest_dir):
             [zstd, "-d", "-c", archive], stdout=subprocess.PIPE, check=True
         ).stdout
         with tarfile.open(fileobj=io.BytesIO(out)) as tf:
-            tf.extractall(dest_dir)
+            _extractall(tf, dest_dir)
     else:
         import zstandard
 
@@ -366,7 +366,14 @@ def _unpack_tar_zst(archive, dest_dir):
             dctx = zstandard.ZstdDecompressor()
             with dctx.stream_reader(fh) as reader:
                 with tarfile.open(fileobj=reader, mode="r|") as tf:
-                    tf.extractall(dest_dir)
+                    _extractall(tf, dest_dir)
+
+
+def _extractall(tf, dest_dir):
+    try:
+        tf.extractall(dest_dir, filter="tar")
+    except TypeError:  # Python < 3.12 has no filter argument
+        tf.extractall(dest_dir)
 
 
 def _install_lean_manually():
