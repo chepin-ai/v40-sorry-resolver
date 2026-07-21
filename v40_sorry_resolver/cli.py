@@ -12,7 +12,7 @@ import os
 import sys
 from typing import Optional
 
-from v40_sorry_resolver.config import V40Config
+from v40_sorry_resolver.config import V40Config, VALID_VERIFIERS
 from v40_sorry_resolver.llm.router import MultiLLMRouter, Role
 from v40_sorry_resolver.llm.client import LLMResponse
 from v40_sorry_resolver.verify.base import build_verifier
@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=None, help="parallel worker count")
     p.add_argument(
         "--verifier",
-        choices=["subprocess", "dojo", "mock"],
+        choices=list(VALID_VERIFIERS),
         default=None,
         help="verification backend",
     )

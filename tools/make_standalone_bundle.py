@@ -96,6 +96,9 @@ FOOTER = ''')
 
 LEAN_VERSION = "4.20.0"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.20.0"
+# Full package-CLI help, captured at bundle build time so that `--help`
+# works with zero third-party dependencies installed.
+CLI_HELP = __CLI_HELP_REPR__
 GHFAST_PREFIX = "https://ghfast.top/"
 TUNA_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 PYPI_INDEX = "https://pypi.org/simple"
@@ -247,10 +250,13 @@ class _StalledDownload(Exception):
     """Raised when a mirror connects but transfers too slowly."""
 
 
-def _download(urls, dest, timeout=300, min_rate_kbps=8, stall_window=30,
-              max_attempts=6):
+def _download(urls, dest, timeout=300, connect_timeout=30, min_rate_kbps=8,
+              stall_window=30, max_attempts=6):
     """Try each URL in order (direct first, ghfast proxy fallback).
 
+    - ``connect_timeout`` caps the TCP connect + each blocking read, so a
+      half-dead mirror that hangs the handshake is abandoned within ~30s
+      instead of blocking for the full ``timeout`` per attempt.
     - A mirror that connects but sustains < ``min_rate_kbps`` KiB/s after a
       ``stall_window`` seconds grace period counts as failed, so a crawling
       direct link quickly falls through to the proxy mirror.
@@ -274,7 +280,7 @@ def _download(urls, dest, timeout=300, min_rate_kbps=8, stall_window=30,
                 req = urllib.request.Request(url, headers=headers)
                 start = time.monotonic()
                 got = 0
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=connect_timeout) as resp:
                     status = getattr(resp, "status", 200) or 200
                     if resume_from and status != 206:
                         resume_from = 0  # server ignored Range; start over
@@ -846,10 +852,10 @@ def main(argv=None):
         argv = sys.argv[1:]
     argv = list(argv)
     if _argv_has_flag(argv, "--help", "-h"):
-        src = unpack_bundle()
-        from v40_sorry_resolver.cli import main as cli_main
-
-        return cli_main(["--help"])
+        # Dependency-free: print the CLI help embedded at build time. Works
+        # on a bare machine before any bootstrap (no openai/Lean required).
+        print(CLI_HELP)
+        return 0
 
     work_root = _default_work_root()
     if not _argv_has_flag(argv, "--skip-bootstrap"):
@@ -933,12 +939,30 @@ def _format_b64(b64):
     return "".join(f'    "{c}"\n' for c in chunks)
 
 
+def _capture_cli_help():
+    """Import the package CLI and capture its --help text (best effort)."""
+    try:
+        if REPO_ROOT not in sys.path:
+            sys.path.insert(0, REPO_ROOT)
+        from v40_sorry_resolver.cli import build_parser
+
+        return build_parser().format_help()
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "v40 standalone (package CLI help unavailable at build time: "
+            f"{exc}). Forwarded options: --project/--project-paths, --sorrydb,"
+            " --workers, --verifier, --wall-clock-budget, --task-limit,"
+            " --resume/--no-resume, --output-dir, --dry-run, --mock-llm."
+        )
+
+
 def build_bundle(mini_project=DEFAULT_MINI_PROJECT, out_file=OUT_FILE):
     if not os.path.isdir(mini_project):
         raise FileNotFoundError(f"mini project not found: {mini_project}")
     pkg_b64 = _zip_b64(_iter_package_files())
     mini_b64 = _zip_b64(_iter_mini_project_files(mini_project))
-    body = HEADER + _format_b64(pkg_b64) + MIDDLE + _format_b64(mini_b64) + FOOTER
+    footer = FOOTER.replace("__CLI_HELP_REPR__", repr(_capture_cli_help()))
+    body = HEADER + _format_b64(pkg_b64) + MIDDLE + _format_b64(mini_b64) + footer
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as fh:
         fh.write(body)
