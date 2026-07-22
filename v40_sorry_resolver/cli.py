@@ -208,6 +208,12 @@ async def async_main(args: argparse.Namespace) -> int:
         cfg.work_dir = KAGGLE_WORK_DIR
     os.makedirs(cfg.work_dir, exist_ok=True)
 
+    # Auto-clamp: a soft deadline beyond the wall-clock budget is meaningless
+    # (e.g. default 32400s vs --wall-clock-budget 1500); degrade gracefully
+    # instead of warning.
+    if cfg.soft_deadline_s >= cfg.wall_clock_budget_s:
+        cfg.soft_deadline_s = 0.9 * cfg.wall_clock_budget_s
+
     problems = []
     if hasattr(cfg, "validate"):
         problems = cfg.validate() or []
